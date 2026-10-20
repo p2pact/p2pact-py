@@ -282,7 +282,7 @@ class Node:
         s.last_recv = now
         self.current.setdefault(s.peer, s)
         ps = self._peer(s.peer)
-        self._seen(ps, frm, now)
+        self._seen(ps, frm, now, s.local)
         ps.st.receive(now, plain, lambda m, z: self._inbound(s.peer, m, z))
         if ps.st.ack_due and now >= ps.st.ack_due:
             self._wake()
@@ -308,7 +308,7 @@ class Node:
         self.sessions[local] = s
         self.current[peer] = s
         self.handshakes += 1
-        self._seen(ps, frm, now)
+        self._seen(ps, frm, now, s.local)
         self._boot(ps, _u32(payload, 8))
         frm[0].send(frm[1], bytes((P_RESP,)) + _be32(s.remote) + _be32(local) + resp)
         if len(payload) > 12:
@@ -332,7 +332,7 @@ class Node:
         self.current[h["peer"]] = s
         self.handshakes += 1
         ps = self._peer(h["peer"])
-        self._seen(ps, frm, now)
+        self._seen(ps, frm, now, s.local)
         self._boot(ps, _u32(payload, 0))
         self._send_info(h["peer"])
         for p, f in h["early"]:
@@ -389,7 +389,7 @@ class Node:
         self.sessions[local] = s
         self.current[p.addr] = s
         ps = self._peer(p.addr)
-        self._seen(ps, frm, now)
+        self._seen(ps, frm, now, s.local)
         self._boot(ps, int(pp[1] or 0))
         frm[0].send(frm[1], bytes((P_PAIR3,)) + _be32(s.remote) + msg3)
         self._paired(p)
@@ -415,7 +415,7 @@ class Node:
         self.sessions[local] = s
         self.current[p.addr] = s
         ps = self._peer(p.addr)
-        self._seen(ps, frm, now)
+        self._seen(ps, frm, now, s.local)
         self._boot(ps, int(pp[1] or 0))
         self._paired(p)
 
@@ -496,15 +496,25 @@ class Node:
             ps = self.peers[peer] = _PeerState()
         return ps
 
-    def _seen(self, ps, frm, now):
-        e = ps.eps.setdefault(_key(frm), {"ep": frm, "last_recv": 0.0, "last_send": 0.0})
-        e["last_recv"] = now
+    def _seen(self, ps, frm, now, session):
+        e = ps.eps.setdefault(_key(frm), {"ep": frm, "last_recv": 0.0, "last_send": 0.0, "session": 0})
+        e["last_recv"], e["session"] = now, session
 
     def _candidates(self, peer, ps, now, all_: bool) -> list[dict]:
         alive = [e for e in ps.eps.values() if now - e["last_recv"] <= ALIVE_FOR]
+        cur = self.current.get(peer)
+        if cur and not all_:  # roads of the current session: earlier ones may be gone
+            mine = [e for e in alive if e.get("session") == cur.local]
+            if mine:
+                alive = mine
         if alive and not all_:
             rank = lambda e: {"udp": 0, "tcp": 1}.get(e["ep"][0].name, 2)
-            return [min(alive, key=rank)]
+            # the road heard from last; a better kind only if heard within half a second of it
+            best = max(alive, key=lambda e: e["last_recv"])
+            for e in alive:
+                if rank(e) < rank(best) and best["last_recv"] - e["last_recv"] < 0.5:
+                    best = e
+            return [best]
         out = alive
         p = self.trust.get(peer)
         if not p:
@@ -513,7 +523,7 @@ class Node:
             if not road:
                 continue
             for a in addrs or []:
-                e = ps.eps.setdefault(_key((road, a)), {"ep": (road, a), "last_recv": 0.0, "last_send": 0.0})
+                e = ps.eps.setdefault(_key((road, a)), {"ep": (road, a), "last_recv": 0.0, "last_send": 0.0, "session": 0})
                 if e not in out:
                     out.append(e)
         return out
@@ -528,11 +538,13 @@ class Node:
 
     def _start_init(self, now, peer, ps, first: bytes | None):
         p = self.trust.get(peer)
-        if not p or now - ps.last_init < INIT_EVERY:
+        if not p or now - ps.last_init < _init_gap(ps):
             return
         ps.last_init = now
-        for idx in [i for i, h in self.hs.items() if not h["pair"] and h.get("peer") == peer]:
-            del self.hs[idx]
+        # keep the last few unanswered starts: a reply to any of them opens the session
+        pending = sorted((h["at"], i) for i, h in self.hs.items() if not h["pair"] and h.get("peer") == peer)
+        while len(pending) >= 3:
+            del self.hs[pending.pop(0)[1]]
         hs = Handshake("IK", True, PROLOGUE, self.id.key, rs=p.key)
         msg1 = hs.write_message(struct.pack(">Q", int(now * 1e9)) + _be32(self.boot) + (first or b""))
         local = self._new_index()
@@ -557,13 +569,16 @@ class Node:
         for peer, ps in list(self.peers.items()):
             s = self.current.get(peer)
             if not s:
-                if not ps.st.idle() and now - ps.last_init >= INIT_EVERY and self.trust.get(peer):
+                if not ps.st.idle() and now - ps.last_init >= _init_gap(ps) and self.trust.get(peer):
                     nxt = ps.st.next_packet(now)
                     self._start_init(now, peer, ps, nxt[0] if nxt else None)
                 continue
             if not ps.st.idle() and now - s.last_recv > 10 and ps.st.stuck():
                 del self.current[peer]
                 continue
+            c = self._candidates(peer, ps, now, False)
+            if len(c) == 1:
+                ps.st.reliable = c[0]["ep"][0].name != "udp"
             for i in range(257):
                 if i == 256:
                     self._wake()
@@ -704,6 +719,11 @@ class Node:
             if ps:
                 ps.st.push(msg, False)
         self._wake()
+
+
+def _init_gap(ps) -> float:
+    """Retry a handshake after three measured round trips (0.25–2 s), else after a second."""
+    return INIT_EVERY if ps.st.srtt == 0 else min(max(3 * ps.st.srtt, 0.25), 2.0)
 
 
 def _ids(v) -> list[bytes]:

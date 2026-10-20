@@ -48,6 +48,7 @@ class Stream:
         self.cwnd, self.ssthresh = float(CWND_START), float(CWND_MAX)
         self.srtt = self.rttvar = self.min_rtt = self.last_cut = 0.0
         self.delivered, self.bw, self.bw_at = 0, 0.0, 0.0
+        self.inflight_bytes, self.reliable = 0, False
         self.recv_next = 1
         self.early: dict[int, Part] = {}
         self.assembling: list[bytes] = []
@@ -65,12 +66,17 @@ class Stream:
         if r >= self.bw or now - self.bw_at > 2:
             self.bw, self.bw_at = r, now
 
-    def window(self) -> int:
-        w = int(self.cwnd)
+    def can_send(self) -> bool:
+        """The congestion window, capped by twice the BDP in bytes while a queue builds;
+        no window of our own on a reliable road (TCP controls congestion itself)."""
+        if self.reliable:
+            return len(self.inflight) < CWND_MAX
+        if len(self.inflight) >= int(self.cwnd):
+            return False
         queue = self.srtt > self.min_rtt + max(self.min_rtt / 2, 0.01)
         if queue and self.bw > 0 and self.min_rtt > 0:
-            w = min(w, max(int(2 * self.bw * self.min_rtt / MAX_PART) + 4, 4))
-        return w
+            return self.inflight_bytes < 2 * self.bw * self.min_rtt + 4 * MAX_PART
+        return True
 
     def _timeout(self, p: Part, ahead: int) -> float:
         t = self.rto()
@@ -107,7 +113,7 @@ class Stream:
 
     def reset(self):
         pending = sorted(self.inflight.values(), key=lambda p: p.seq) + self.queue
-        self.next, self.inflight, self.queue = 1, {}, []
+        self.next, self.inflight, self.queue, self.inflight_bytes = 1, {}, [], 0
         for p in pending:
             p.seq, p.first, p.sent, p.tries, p.delivered = self.next, 0.0, 0.0, 0, 0
             self.next += 1
@@ -136,9 +142,10 @@ class Stream:
         if p is not None:
             retry = True
             self._lost(now)
-        elif self.queue and len(self.inflight) < self.window():
+        elif self.queue and self.can_send():
             p = self.queue.pop(0)
             self.inflight[p.seq] = p
+            self.inflight_bytes += len(p.data)
         ack = self.recv_next > 1 and (p is not None or force_ack or (self.ack_due and now >= self.ack_due))
         if p is None and not ack:
             return None
@@ -186,6 +193,7 @@ class Stream:
                     if dt > 0:
                         self._rate(now, (self.delivered - p.delivered) / dt)
                 del self.inflight[seq]
+                self.inflight_bytes -= len(p.data)
                 done += 1
 
             for seq in [s for s in self.inflight if s <= upto]:

@@ -150,8 +150,10 @@ class Trust:
                 j["via"] = p.via
             out.append(j)
         os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
-        with open(os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        tmp = self.path + ".tmp"  # replaced in one step: never read half-written
+        with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
             json.dump(out, f, indent=2)
+        os.replace(tmp, self.path)
 
 
 class Invite:
