@@ -36,6 +36,9 @@ async def main():
 asyncio.run(main())
 ```
 
+`call_on` / `event_on` send on a stream (one per chat): a loss on one chat does not hold up
+the others.
+
 ## Status
 
 Pairing, sessions, UDP and TCP roads, delivery with congestion control, messages,
