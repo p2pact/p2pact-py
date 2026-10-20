@@ -1,6 +1,6 @@
 # p2pact-py
 
-Python implementation of **P2PACT — the P2P Agent Chat Protocol**: chat with your AI agents,
+Python implementation of **P2PACT — the P2P Agent Chat Transport Protocol**: chat with your AI agents,
 and let them chat with each other, across your own devices — no servers, no accounts, over any
 connection.
 

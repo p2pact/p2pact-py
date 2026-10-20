@@ -1,7 +1,7 @@
 [project]
 name = "p2pact"
 version = "0.1.0"
-description = "Python implementation of P2PACT — the P2P Agent Chat Protocol: chat with your AI agents across your own devices, no servers."
+description = "Python implementation of P2PACT — the P2P Agent Chat Transport Protocol: chat with your AI agents across your own devices, no servers."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
