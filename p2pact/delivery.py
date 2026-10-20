@@ -99,11 +99,16 @@ class Stream:
         t = self.rto()
         if self.bw > 0:
             t += ahead * MAX_PART / self.bw
-        for _ in range(1, p.tries):
+        # back off only on congestion, or after three tries in a row: a random loss is no reason
+        backoff = p.tries - 1 if self._queueing() else max(0, p.tries - 3)
+        for _ in range(backoff):
             if t >= RTO_MAX:
                 break
             t *= 2
         return min(t, RTO_MAX)
+
+    def _queueing(self) -> bool:
+        return self.srtt > self.min_rtt + max(self.min_rtt / 2, 0.01)
 
     def _sample(self, rtt):
         if self.min_rtt == 0 or rtt < self.min_rtt:
@@ -117,12 +122,14 @@ class Stream:
         self.srtt = (7 * self.srtt + rtt) / 8
 
     def _acked(self, n):
+        queue = self._queueing()  # slow start, and while no queue builds (as BBR probes)
         for _ in range(n):
-            self.cwnd += 1 if self.cwnd < self.ssthresh else 1 / self.cwnd
+            self.cwnd += 1 if self.cwnd < self.ssthresh or not queue else 1 / self.cwnd
         self.cwnd = min(self.cwnd, CWND_MAX)
 
     def _lost(self, now):
-        if now - self.last_cut < max(self.srtt, RTO_MIN):
+        # only while a queue builds: a loss without one is random, not congestion
+        if now - self.last_cut < max(self.srtt, RTO_MIN) or not self._queueing():
             return
         self.last_cut = now
         self.ssthresh = max(self.cwnd / 2, CWND_MIN)
@@ -230,12 +237,14 @@ class Stream:
             if count > 64:
                 raise ValueError("too many ranges")
             done = 0
+            newest = 0.0  # the latest send time among the parts this ack covers
 
             def ack(seq):
-                nonlocal done
+                nonlocal done, newest
                 p = self.inflight.get(seq)
                 if p is None:
                     return
+                newest = max(newest, p.sent)
                 self.delivered += len(p.data)
                 if p.tries == 1:
                     dt = now - p.sent
@@ -258,6 +267,14 @@ class Stream:
                 beyond += run
                 cursor = start + run
             self._acked(done)
+            if newest:  # time-based loss detection (RACK): sent well before one that arrived
+                reorder = max(self.srtt / 4, 0.001)
+                lost = False
+                for p in self.inflight.values():
+                    if p.sent and p.sent + reorder < newest:
+                        p.sent, lost = 0.0, True
+                if lost:
+                    self._lost(now)
             if beyond:
                 gap = self.inflight.get(upto + 1)
                 if gap and (beyond >= 3 or now - gap.sent >= max(self.srtt / 4, ACK_DELAY)):
