@@ -196,7 +196,11 @@ class Node:
     # --- calls and events ---
 
     async def call(self, peer: str, tool: int, method: int, *args) -> list[bytes]:
-        """Calls tool.method on a known device; the result elements come as raw CBOR."""
+        """Calls tool.method on a known device (stream 0, in order); raw CBOR result elements."""
+        return await self.call_on(peer, 0, tool, method, *args)
+
+    async def call_on(self, peer: str, stream: int, tool: int, method: int, *args) -> list[bytes]:
+        """call on a stream: ordered within it, independent of other streams (one per chat)."""
         ps = self._peer(peer)
         if not ps:
             raise P2PACTError(ERR_FAILED, "unknown device")
@@ -205,16 +209,19 @@ class Node:
         fut = asyncio.get_running_loop().create_future()
         ps.calls[cid] = fut
         try:
-            self._push(ps, encode([0, cid, tool, method, *args]))
+            self._push(ps, encode([0, cid, tool, method, *args]), stream)
             return await fut
         finally:
             ps.calls.pop(cid, None)
 
     def event(self, peer: str, tool: int, ev: int, *args):
+        self.event_on(peer, 0, tool, ev, *args)
+
+    def event_on(self, peer: str, stream: int, tool: int, ev: int, *args):
         ps = self._peer(peer)
         if not ps:
             raise P2PACTError(ERR_FAILED, "unknown device")
-        self._push(ps, encode([3, tool, ev, *args]))
+        self._push(ps, encode([3, tool, ev, *args]), stream)
 
     def paths(self, peer: str) -> list[str]:
         ps = self.peers.get(peer)
@@ -283,7 +290,7 @@ class Node:
         self.current.setdefault(s.peer, s)
         ps = self._peer(s.peer)
         self._seen(ps, frm, now, s.local)
-        ps.st.receive(now, plain, lambda m, z: self._inbound(s.peer, m, z))
+        ps.st.receive(now, plain, lambda m, z, st: self._inbound(s.peer, m, z, st))
         if ps.st.ack_due and now >= ps.st.ack_due:
             self._wake()
 
@@ -312,7 +319,7 @@ class Node:
         self._boot(ps, _u32(payload, 8))
         frm[0].send(frm[1], bytes((P_RESP,)) + _be32(s.remote) + _be32(local) + resp)
         if len(payload) > 12:
-            ps.st.receive(now, payload[12:], lambda m, z: self._inbound(peer, m, z))
+            ps.st.receive(now, payload[12:], lambda m, z, st: self._inbound(peer, m, z, st))
         self._send_info(peer)
 
     def _on_resp(self, now, pkt, frm):
@@ -432,7 +439,7 @@ class Node:
     def _send_info(self, peer: str):
         self._push(self._peer(peer), encode([3, 0, 2, *self._info()]))
 
-    def _message(self, peer: str, msg: bytes):
+    def _message(self, peer: str, msg: bytes, stream: int = 0):
         try:
             a = decode_array_raw(msg)
         except Exception:
@@ -461,7 +468,7 @@ class Node:
                         out = [2, cid, ERR_FAILED, str(e)]
                 ps2 = self._peer(peer)
                 if ps2:
-                    self._push(ps2, encode(out))
+                    self._push(ps2, encode(out), stream)  # the result goes back on the call's stream
             asyncio.get_running_loop().create_task(run())
         elif kind in (1, 2):
             fut = ps.calls.get(decode(a[1]))
@@ -618,31 +625,31 @@ class Node:
 
     # --- compression (spec §5) ---
 
-    def _push(self, ps: _PeerState, msg: bytes):
+    def _push(self, ps: _PeerState, msg: bytes, stream: int = 0):
         d, slot = self.dicts.pick(ps.dicts, ps.lacks)
         z = None if self.no_compression else compress(msg, d, slot)
         if z:
-            ps.st.push(z, True)
+            ps.st.push(z, True, stream)
         else:
-            ps.st.push(msg, False)
+            ps.st.push(msg, False, stream)
         self._wake()
 
-    def _inbound(self, peer: str, msg: bytes, zip_: bool):
+    def _inbound(self, peer: str, msg: bytes, zip_: bool, stream: int = 0):
         ps = self._peer(peer)
         if not ps:
             return
         if ps.waiting:
             plain, _ = self._unzip(ps, msg, zip_)
             if plain is not None and _out_of_order(plain):
-                self._message(peer, plain)
+                self._message(peer, plain, stream)
                 self._drain(peer, ps)
                 return
-        ps.waiting.append((msg, zip_))
+        ps.waiting.append((msg, zip_, stream))
         self._drain(peer, ps)
 
     def _drain(self, peer, ps):
         while ps.waiting:
-            msg, zip_ = ps.waiting[0]
+            msg, zip_, stream = ps.waiting[0]
             plain, why = self._unzip(ps, msg, zip_)
             if why == "missing":
                 self._fetch_dict(peer, ps, ps.dicts[msg[0] - 1])
@@ -651,7 +658,7 @@ class Node:
                 return
             ps.waiting.pop(0)
             if plain is not None:
-                self._message(peer, plain)
+                self._message(peer, plain, stream)
 
     def _unzip(self, ps, msg, zip_):
         if not zip_:

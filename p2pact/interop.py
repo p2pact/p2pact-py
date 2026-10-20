@@ -47,7 +47,7 @@ async def main():
             elif cmd == "known":
                 say({"known": node.trust.get(req["peer"]) is not None})
             elif cmd == "call":
-                res = await asyncio.wait_for(node.call(req["peer"], 64, 1, base64.b64decode(req["data"])), 60)
+                res = await asyncio.wait_for(node.call_on(req["peer"], int(req.get("stream", 0)), 64, 1, base64.b64decode(req["data"])), 60)
                 say({"data": base64.b64encode(decode(res[0])).decode()})
             elif cmd == "dict":
                 node.add_dict(base64.b64decode(req["raw"]))
