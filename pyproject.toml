@@ -21,3 +21,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["p2pact"]
+
+[tool.setuptools.package-data]
+p2pact = ["*.zdict"]

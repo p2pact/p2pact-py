@@ -39,10 +39,14 @@ asyncio.run(main())
 `call_on` / `event_on` send on a stream (one per chat): a loss on one chat does not hold up
 the others.
 
+Compression: `node.add_dict(COMMON_DICT)` (from `p2pact.common`) gives the common dictionary
+until a device has its own; each device trains one for every device it talks to, on that
+conversation only, in the background (`no_learning = True` turns that off).
+
 ## Status
 
 Pairing, sessions, UDP and TCP roads, delivery with congestion control, messages,
-compression with dictionaries. Not yet: the relay road, the family tool, Bluetooth.
+compression with the common dictionary and per-device dictionaries of its own. Not yet: the relay road, the family tool, Bluetooth.
 
 ## Develop
 
