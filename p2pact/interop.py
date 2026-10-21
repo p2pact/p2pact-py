@@ -52,6 +52,10 @@ async def main():
             elif cmd == "dict":
                 node.add_dict(base64.b64decode(req["raw"]))
                 say({"ok": True})
+            elif cmd == "dict-state":
+                own, using, training = node.dict_state(req["peer"])
+                b64 = lambda x: base64.b64encode(x).decode() if x else None
+                say({"own": b64(own), "using": b64(using), "training": training})
             elif cmd == "close":
                 break
             else:
