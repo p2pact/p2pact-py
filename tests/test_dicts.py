@@ -1,14 +1,16 @@
 import asyncio
 import os
+import time
 
 import pytest
 import zstandard
 
-from p2pact import learn
+from p2pact import learn, node
+from p2pact.cbor import encode
 from p2pact.common import COMMON_DICT
 from p2pact.compress import Dict, DictStore, compress, decompress
 from p2pact.learn import History, history_path
-from p2pact.node import P2PACTError
+from p2pact.node import ERR_FAILED, Node, P2PACTError, _PeerState, _bootstrap
 
 from test_node import echo, make, pair
 
@@ -305,6 +307,79 @@ def test_no_dict_for_listener(tmp_path, quick):
             await wait_for("a did not train", lambda: a.dicts.own(b.id.addr) is not None)
             await asyncio.sleep(1)
             assert b.dicts.own(a.id.addr) is None
+        finally:
+            a.close()
+            b.close()
+    asyncio.run(run())
+
+
+def test_lost_list_asks_info(tmp_path, monkeypatch):
+    """The receiver lost the sender's list (it restarted, the hello did not come again) while the
+    sender keeps compressing: the receiver asks for the hello (0.2 info) and runs the messages."""
+    monkeypatch.setattr(node, "HOLD_ASK", 60.0)  # at once, not by the held-messages timer
+
+    async def run():
+        a, b = await make(tmp_path, "phone"), await make(tmp_path, "mac")
+        try:
+            await pair(a, b)
+            raw = test_dict(0)
+            a.add_dict(raw)
+            b.add_dict(raw)
+            await wait_for("lists", lambda: a.peers[b.id.addr].dicts and b.peers[a.id.addr].dicts)
+            b.peers[a.id.addr].dicts = []  # b no longer knows a's list
+            t = time.monotonic()
+            for _ in range(3):
+                await echo(a, b, LONG)
+            assert time.monotonic() - t < 10, "the list came back only by itself, not by 0.2 info"
+            assert b.peers[a.id.addr].dicts
+        finally:
+            a.close()
+            b.close()
+    asyncio.run(run())
+
+
+def test_guess_compressed_hello(tmp_path):
+    """A sender of an older version compressed its hello: the receiver without its list reads it
+    with a dictionary it has for that sender. Only a hello or a list is taken this way."""
+    b = Node(str(tmp_path / "mac"), "mac")
+    d = Dict(test_dict(0))
+    b.dicts.add(d)
+    ps = _PeerState("phone")
+    text = LONG.decode() * 3
+    hello = encode([3, 0, 2, "Phone", "android", "p2pact-kotlin", {}, [d.id], {}, text])
+    z = compress(hello, d, 7)
+    other = encode([3, 64, 1, text])
+    zo = compress(other, d, 7)
+    assert z and zo
+    assert b._guess_bootstrap(ps, z) == hello
+    assert b._guess_bootstrap(ps, zo) is None
+    assert _bootstrap(hello) and not _bootstrap(other)
+
+
+def test_held_dropped(tmp_path, monkeypatch):
+    """Messages held for a list that never comes are not held forever: they are dropped (the
+    sender resends what matters), the application is told, and the lists are learnt anew."""
+    monkeypatch.setattr(node, "HOLD_ASK", 0.2)
+    monkeypatch.setattr(node, "HOLD_DROP", 1.0)
+
+    async def run():
+        a, b = await make(tmp_path, "phone"), await make(tmp_path, "mac")
+        try:
+            await pair(a, b)
+            raw = test_dict(0)
+            a.add_dict(raw)
+            b.add_dict(raw)
+            await wait_for("lists", lambda: a.peers[b.id.addr].dicts and b.peers[a.id.addr].dicts)
+
+            def refuse(peer, args):
+                raise P2PACTError(ERR_FAILED, "no")
+            a.handle(0, 2, refuse)
+            held = []
+            b.on_held = lambda peer, k: held.append(k)
+            b.peers[a.id.addr].dicts = []  # b lost a's list, and a will not tell it
+            a.event(b.id.addr, 9, 1, LONG.decode())
+            await wait_for("held messages were never dropped", lambda: held, 10)
+            assert held[0] >= 1
         finally:
             a.close()
             b.close()

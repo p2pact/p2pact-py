@@ -21,6 +21,7 @@ from .store import PROLOGUE, Identity, Invite, Peer, Trust, hints_from_wire, hin
 P_INIT, P_RESP, P_PAIR1, P_PAIR2, P_PAIR3, P_DATA, P_RESET = 1, 2, 3, 4, 5, 6, 7
 TS_SKEW_NS = 120 * 10**9
 INIT_EVERY, AUTO_CONNECT, ALIVE_FOR, KEEPALIVE_GAP, SESSION_IDLE = 1.0, 30.0, 60.0, 25.0, 180.0
+HOLD_ASK, HOLD_DROP = 15.0, 120.0  # held messages: ask again, then drop them (_unhold)
 
 ERR_NO_METHOD, ERR_BAD_ARGS, ERR_NOT_FOUND, ERR_FORBIDDEN, ERR_FAILED, ERR_NOT_DELIVERED = 1, 2, 3, 4, 5, 6
 
@@ -100,7 +101,10 @@ class _PeerState:
         self.dicts: list[bytes] = []  # its dictionaries (ids) by slot — from its hello and 0.5
         self.lacks: list[bytes] = []  # it asked us for these, so it lacks them until it announces again
         self.waiting: list[tuple[bytes, bool, int]] = []  # waiting for a dictionary: run in order once it arrives
+        self.wait_since = 0.0  # when the head of waiting started to wait (_unhold unblocks it)
         self.fetching = False
+        self.asking_info = False  # our 0.2 info call is on its way (_ask_info)
+        self.asked_info = 0.0  # when we asked
         self.tried: list[bytes] = []  # dictionaries of its list we asked it for and did not get
         self.hist: History | None = None  # what we sent it and got from it, to train our dictionary for it
         self.sys_calls: set[int] = set()  # our calls of tool 0: their results are not conversation
@@ -120,6 +124,12 @@ class Node:
         # on_event(peer, tool, ev, raw_args) receives tool events (except tool 0): in the order
         # sent on each stream, one at a time, together with that stream's calls (spec §6)
         self.on_event = self.on_paired = self.on_hello = self.allow_dict = None
+        # on_held(peer, held) is called when messages from a device waited too long for a
+        # dictionary or its list and were dropped (held — how many): the application can tell
+        # the user or resend
+        self.on_held = None
+        self.hints_sent: bytes | None = None  # our addresses as last announced (_reannounce)
+        self.hints_at = 0.0  # when last checked
         self._later: set = set()  # replies given later (spec §6): their tasks, kept until done
         self.no_compression = False  # what we send goes uncompressed (benchmarks, debugging)
         self.no_learning = False  # do not train our own dictionaries on what we send (spec §5)
@@ -501,6 +511,7 @@ class Node:
         ps.boot = boot
 
     def _send_info(self, peer: str):
+        self.hints_sent = encode(hints_to_wire(self._hints()))  # what the devices know of us (_reannounce)
         self._push(self._peer(peer), encode([3, 0, 2, *self._info(peer)]))
 
     def _message(self, peer: str, msg: bytes, stream: int = 0):
@@ -515,8 +526,8 @@ class Node:
         if not ps:
             return
         if kind == 0 and len(a) >= 4:
-            cid, tool, args = decode(a[1]), decode(a[2]), a[4:]
-            h = self.handlers.get((tool, decode(a[3])))
+            cid, tool, method, args = decode(a[1]), decode(a[2]), decode(a[3]), a[4:]
+            h = self.handlers.get((tool, method))
             if tool != 0:
                 self._hear(ps, msg)
             boot = ps.boot
@@ -535,7 +546,11 @@ class Node:
                 # the result goes back on the call's stream, unless the caller restarted meanwhile
                 ps2 = self._peer(peer)
                 if ps2 and (boot == 0 or ps2.boot == boot):
-                    self._push(ps2, encode(out), stream, tool != 0, reply=True)
+                    if tool == 0 and method == 2:  # a hello, like the event: never compressed
+                        ps2.st.push(encode(out), False, stream, True)
+                        self._wake()
+                    else:
+                        self._push(ps2, encode(out), stream, tool != 0, reply=True)
 
             async def run():
                 if h is None:
@@ -726,6 +741,8 @@ class Node:
             ps = self._peer(p.addr)
             if ps and p.addr not in self.current and now - ps.last_init >= AUTO_CONNECT:
                 self._start_init(now, p.addr, ps, None)
+        self._unhold(now)
+        self._reannounce(now)
         for idx, s in list(self.sessions.items()):
             if self.current.get(s.peer) is not s and now - s.last_recv > SESSION_IDLE:
                 del self.sessions[idx]
@@ -735,6 +752,42 @@ class Node:
         for k, inv in list(self.invites.items()):
             if now > inv.exp:
                 del self.invites[k]
+
+    def _unhold(self, now: float):
+        """Held messages (spec §5): a device's messages wait for its dictionary or its list. That
+        must not last: after HOLD_ASK we ask again (its hello, the dictionary); after HOLD_DROP the
+        held messages are dropped — the sender resends what matters — and the lists are learnt
+        anew."""
+        for peer, ps in list(self.peers.items()):
+            if not ps.waiting:
+                continue
+            held = now - ps.wait_since
+            if held >= HOLD_DROP:
+                k = len(ps.waiting)
+                ps.waiting, ps.fetching, ps.asking_info = [], False, False
+                ps.dicts, ps.lacks, ps.tried = [], [], []
+                self._send_info(peer)  # ours again: the other side re-learns what we have
+                if self.on_held:
+                    asyncio.get_running_loop().call_soon(self.on_held, peer, k)
+            elif held >= HOLD_ASK:
+                if not ps.dicts:
+                    self._ask_info(peer, ps)
+                else:
+                    ps.tried = []
+                    self._drain(peer, ps)
+
+    def _reannounce(self, now: float):
+        """Our addresses changed (another network): tell the devices in session at once with our
+        hello, not at the next handshake — they would keep trying the old address until a relay or
+        a restart brought them together."""
+        if now - self.hints_at < 5:
+            return
+        self.hints_at = now
+        cur = encode(hints_to_wire(self._hints()))
+        if self.hints_sent is None or cur == self.hints_sent:
+            return  # nothing announced yet, or the same
+        for peer in list(self.current):
+            self._send_info(peer)
 
     def _new_index(self) -> int:
         while True:
@@ -750,7 +803,7 @@ class Node:
         list changes only through event 0.5, which travels in the same order as messages.
         talk: the message is conversation (not tool 0), so it goes to the history; reply: a result
         or error, dropped if the other device restarts (spec §4.2)."""
-        if self.no_compression:
+        if self.no_compression or _bootstrap(msg):
             ps.st.push(msg, False, stream, reply)
             self._wake()
             return
@@ -779,6 +832,8 @@ class Node:
                 self._message(peer, plain, stream)
                 self._drain(peer, ps)
                 return
+        if not ps.waiting:
+            ps.wait_since = time.time()
         ps.waiting.append((msg, zip_, stream))
         self._drain(peer, ps)
 
@@ -793,10 +848,54 @@ class Node:
                     return
                 why = "bad"  # a free slot: the message is damaged
             if why == "nolist":
+                # a sender of an older version compresses its hello too: then we would wait for
+                # it forever. Try the dictionaries we have for it — only a hello or a list is taken
+                if (plain := self._guess_bootstrap(ps, msg)) is not None:
+                    ps.waiting.pop(0)
+                    self._message(peer, plain, stream)
+                    continue
+                self._ask_info(peer, ps)
                 return  # wait for a hello or 0.5
             ps.waiting.pop(0)
             if plain is not None:
                 self._message(peer, plain, stream)
+
+    def _guess_bootstrap(self, ps, msg: bytes) -> bytes | None:
+        """Decompresses a message whose slot is beyond the sender's list we know with each
+        dictionary the sender may have used for us (the pair's and the common ones); only a hello
+        or a dictionary list is accepted, None — none fits."""
+        if len(msg) < 2 or msg[0] == 0:
+            return None
+        for d in self.dicts.list(ps.addr):
+            try:
+                plain = decompress(msg, d, MSG_MAX)
+                if _bootstrap(plain):
+                    decode_array_raw(plain)
+                    return plain
+            except Exception:
+                continue
+        return None
+
+    def _ask_info(self, peer, ps):
+        """Asks the device for its hello (0.2 info) when we hold its messages without its list:
+        it may never send the event again on its own. One at a time; a newer device answers
+        uncompressed, an older one — with a slot we may guess (_guess_bootstrap)."""
+        if ps.asking_info or time.time() - ps.asked_info < 10:
+            return
+        ps.asking_info, ps.asked_info = True, time.time()
+
+        async def run():
+            try:
+                res = await asyncio.wait_for(self.call(peer, 0, 2), 30)
+            except Exception:
+                res = None
+            ps.asking_info = False
+            if self.closed or self.peers.get(peer) is not ps or not res or len(res) < 5 or ps.dicts:
+                return
+            ps.dicts = _ids(decode(res[4]))
+            self._fetch_new(peer, ps)
+            self._drain(peer, ps)
+        asyncio.get_running_loop().create_task(run())
 
     def _unzip(self, ps, msg, zip_):
         """The message decompressed, or None and why: "missing" — we lack the dictionary in that
@@ -1025,6 +1124,13 @@ def _init_gap(ps) -> float:
 
 def _ids(v) -> list[bytes]:
     return [x for x in v if isinstance(x, bytes)] if isinstance(v, list) else []
+
+
+def _bootstrap(m: bytes) -> bool:
+    """A hello or a dictionary list ([3, 0, 2|5, …]): they carry what the receiver needs to
+    decompress, so they always go uncompressed — a device that restarted (and lost our list) must
+    be able to read them."""
+    return len(m) > 3 and m[1] == 3 and m[2] == 0 and m[3] in (2, 5)
 
 
 def _out_of_order(m: bytes) -> bool:

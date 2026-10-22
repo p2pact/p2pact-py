@@ -69,3 +69,24 @@ def test_tcp_only(tmp_path):
             a.close()
             b.close()
     asyncio.run(run())
+
+
+def test_reannounce_on_new_address(tmp_path):
+    """Our addresses changed (another network): the device in session learns them from our hello
+    at once, without a new handshake."""
+    async def run():
+        a, b = await make(tmp_path, "mac"), await make(tmp_path, "phone")
+        try:
+            await pair(a, b)
+            await echo(a, b, b"hi")
+            a._hints = lambda: {"udp": ["10.238.250.33:48740"]}
+            for _ in range(100):
+                p = b.trust.get(a.id.addr)
+                if p and p.hints.get("udp") == ["10.238.250.33:48740"]:
+                    return
+                await asyncio.sleep(0.1)
+            raise AssertionError("b did not learn a's new address")
+        finally:
+            a.close()
+            b.close()
+    asyncio.run(run())
