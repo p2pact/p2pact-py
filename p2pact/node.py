@@ -73,6 +73,7 @@ class _PeerState:
         self.eps: dict[str, dict] = {}
         self.last_ts = 0
         self.boot = 0
+        self.heard = False  # it knows our boot id: sent us session data or answered our handshake
         self.last_init = 0.0
         self.calls: dict[int, asyncio.Future] = {}
         self.call_id = 0
@@ -86,6 +87,7 @@ class _PeerState:
         self.queue: list[tuple[bytes, bool, int, int]] = []  # conversation waiting to be learnt: msg, heard, plain, zips
         self.queued = 0
         self.last_talk = 0.0
+        self.inbox: dict[int, list] = {}  # calls and events waiting for their turn, per stream
 
 
 class Node:
@@ -95,6 +97,8 @@ class Node:
         self.id = Identity.load(dir_)
         self.trust = Trust(dir_)
         self.dicts = DictStore(dir_)
+        # on_event(peer, tool, ev, raw_args) receives tool events (except tool 0): in the order
+        # sent on each stream, one at a time, together with that stream's calls (spec §6)
         self.on_event = self.on_paired = self.on_hello = self.allow_dict = None
         self.no_compression = False  # what we send goes uncompressed (benchmarks, debugging)
         self.no_learning = False  # do not train our own dictionaries on what we send (spec §5)
@@ -148,7 +152,9 @@ class Node:
                     f.set_exception(ConnectionError("node closed"))
 
     def handle(self, tool: int, method: int, h):
-        """h(peer, raw_args) -> list of result values (or an awaitable of it)."""
+        """h(peer, raw_args) -> list of result values (or an awaitable of it). Calls of one device
+        on one stream run one at a time, in the order sent, together with its events there
+        (spec §6); other streams do not wait."""
         self.handlers[(tool, method)] = h
 
     # --- pairing ---
@@ -320,6 +326,7 @@ class Node:
         s.last_recv = now
         self.current.setdefault(s.peer, s)
         ps = self._peer(s.peer)
+        ps.heard = True
         self._seen(ps, frm, now, s.local)
         ps.st.receive(now, plain, lambda m, z, st: self._inbound(s.peer, m, z, st))
         if ps.st.ack_due and now >= ps.st.ack_due:
@@ -349,7 +356,10 @@ class Node:
         self._seen(ps, frm, now, s.local)
         self._boot(ps, _u32(payload, 8))
         frm[0].send(frm[1], bytes((P_RESP,)) + _be32(s.remote) + _be32(local) + resp)
-        if len(payload) > 12:
+        # data in the first packet; from a device that has not heard our boot id it may be
+        # numbered for our previous boot, to be renumbered once it gets our reply: drop it
+        # unacknowledged, it comes again in the session (spec §4.2)
+        if len(payload) > 12 and ps.heard:
             ps.st.receive(now, payload[12:], lambda m, z, st: self._inbound(peer, m, z, st))
         self._send_info(peer)
 
@@ -370,6 +380,7 @@ class Node:
         self.current[h["peer"]] = s
         self.handshakes += 1
         ps = self._peer(h["peer"])
+        ps.heard = True
         self._seen(ps, frm, now, s.local)
         self._boot(ps, _u32(payload, 0))
         self._send_info(h["peer"])
@@ -486,6 +497,7 @@ class Node:
             h = self.handlers.get((tool, decode(a[3])))
             if tool != 0:
                 self._hear(ps, msg)
+            boot = ps.boot
 
             async def run():
                 if h is None:
@@ -500,10 +512,14 @@ class Node:
                         out = [2, cid, e.code, str(e)]
                     except Exception as e:
                         out = [2, cid, ERR_FAILED, str(e)]
+                # the result goes back on the call's stream, unless the caller restarted meanwhile
                 ps2 = self._peer(peer)
-                if ps2:
-                    self._push(ps2, encode(out), stream, tool != 0)  # the result goes back on the call's stream
-            asyncio.get_running_loop().create_task(run())
+                if ps2 and (boot == 0 or ps2.boot == boot):
+                    self._push(ps2, encode(out), stream, tool != 0, reply=True)
+            if tool == 0:  # service calls (a dictionary, a ping) never wait behind a slow handler
+                asyncio.get_running_loop().create_task(run())
+            else:
+                self._inbox(ps, stream, run)
         elif kind in (1, 2):
             cid = decode(a[1])
             fut = ps.calls.get(cid)
@@ -533,8 +549,34 @@ class Node:
                 return
             if tool != 0:
                 self._hear(ps, msg)
-            if self.on_event:
-                asyncio.get_running_loop().call_soon(self.on_event, peer, tool, ev, a[3:])
+            if on := self.on_event:
+                args = a[3:]
+                self._inbox(ps, stream, lambda: on(peer, tool, ev, args))
+
+    def _inbox(self, ps: _PeerState, stream: int, f):
+        """Queues f behind the stream's earlier calls and events: they run one at a time, in the
+        order they came (spec §6). Each stream has its own worker while it has work, so a slow
+        handler holds up its own stream only. f may return an awaitable."""
+        q = ps.inbox.get(stream)
+        if q is not None:
+            q.append(f)
+            return
+        q = ps.inbox[stream] = [f]
+
+        async def work():
+            try:
+                while q:
+                    g = q.pop(0)
+                    try:
+                        r = g()
+                        if asyncio.iscoroutine(r) or isinstance(r, asyncio.Future):
+                            await r
+                    except Exception:
+                        pass  # a failing event handler does not stop the stream
+            finally:
+                if ps.inbox.get(stream) is q:
+                    del ps.inbox[stream]
+        asyncio.get_running_loop().create_task(work())
 
     # --- sending ---
 
@@ -666,13 +708,14 @@ class Node:
 
     # --- compression (spec §5) ---
 
-    def _push(self, ps: _PeerState, msg: bytes, stream: int = 0, talk: bool = False):
+    def _push(self, ps: _PeerState, msg: bytes, stream: int = 0, talk: bool = False, reply: bool = False):
         """Queues a message, compressed when worth it: with our dictionary for this device if it
         has it, else the newest one it also has. The slot refers to our list at send time: the
         list changes only through event 0.5, which travels in the same order as messages.
-        talk: the message is conversation (not tool 0), so it goes to the history."""
+        talk: the message is conversation (not tool 0), so it goes to the history; reply: a result
+        or error, dropped if the other device restarts (spec §4.2)."""
         if self.no_compression:
-            ps.st.push(msg, False, stream)
+            ps.st.push(msg, False, stream, reply)
             self._wake()
             return
         d, slot = self.dicts.pick(ps.addr, ps.dicts, ps.lacks)
@@ -680,9 +723,9 @@ class Node:
         if talk:
             self._learn(ps, msg, d, z)
         if z:
-            ps.st.push(z, True, stream)
+            ps.st.push(z, True, stream, reply)
         else:
-            ps.st.push(msg, False, stream)
+            ps.st.push(msg, False, stream, reply)
         self._wake()
 
     def _inbound(self, peer: str, msg: bytes, zip_: bool, stream: int = 0):

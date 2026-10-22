@@ -33,12 +33,16 @@ def read_uvarint(b: bytes, pos: int) -> tuple[int, int]:
 
 
 class Part:
-    __slots__ = ("seq", "data", "more", "zip", "first", "sent", "tries", "delivered", "stream", "num", "first_of_stream")
+    __slots__ = ("seq", "data", "more", "zip", "copies", "timer", "sent", "tries", "delivered", "stream", "num",
+                 "first_of_stream", "reply")
 
-    def __init__(self, seq, data, more, zip_, stream=0, num=0, first_of_stream=False):
+    def __init__(self, seq, data, more, zip_, stream=0, num=0, first_of_stream=False, reply=False):
         self.seq, self.data, self.more, self.zip = seq, data, more, zip_
         self.stream, self.num, self.first_of_stream = stream, num, first_of_stream
-        self.first = self.sent = 0.0
+        self.reply = reply  # part of a result or error: it answers a call of this boot only
+        self.copies: list[float] = []  # when each copy was sent
+        self.timer = False  # the last copy went because the timer ran out
+        self.sent = 0.0
         self.tries = self.delivered = 0
 
 
@@ -136,18 +140,31 @@ class Stream:
         self.cwnd = self.ssthresh
 
     def reset(self):
+        """The other device restarted: its receiving started from zero. Our unacknowledged parts
+        are renumbered from 1; receiving restarts from 1 too. Replies are dropped: the calls they
+        answer ended with the restart, and its new call ids start from 1 again, so a stale reply
+        would answer a new call."""
         pending = sorted(self.inflight.values(), key=lambda p: p.seq) + self.queue
         self.next, self.inflight, self.queue, self.inflight_bytes = 1, {}, [], 0
         self._reset_recv()
+        # the path may be another one now: measure it afresh (a stale minimum round trip would
+        # read every round trip as a queue, or every ack of a retransmission as a real one)
+        self.cwnd, self.ssthresh, self.last_cut = float(CWND_START), float(CWND_MAX), 0.0
+        self.srtt = self.rttvar = self.min_rtt = 0.0
+        self.bw, self.bw_at = 0.0, 0.0
         for p in pending:
-            p.seq, p.first, p.sent, p.tries, p.delivered = self.next, 0.0, 0.0, 0, 0
+            if p.reply:
+                continue
+            p.seq, p.copies, p.sent, p.tries, p.delivered, p.timer = self.next, [], 0.0, 0, 0, False
             self.next += 1
             if p.first_of_stream:
                 self.snext[p.stream] = self.snext.get(p.stream, 0) + 1
                 p.num = self.snext[p.stream]
             self.queue.append(p)
 
-    def push(self, msg: bytes, zip_: bool, stream: int = 0):
+    def push(self, msg: bytes, zip_: bool, stream: int = 0, reply: bool = False):
+        """Queues a message in parts on a stream (0 — the ordered default); zip_ marks it
+        compressed, reply — a result or error."""
         num = 0
         if stream:
             num = self.snext[stream] = self.snext.get(stream, 0) + 1
@@ -155,7 +172,7 @@ class Stream:
         while True:
             n = min(len(msg) - off, MAX_PART)
             self.queue.append(Part(self.next, msg[off:off + n], off + n < len(msg), zip_, stream,
-                                   num if first else 0, bool(stream) and first))
+                                   num if first else 0, bool(stream) and first, reply))
             first = False
             self.next += 1
             off += n
@@ -172,6 +189,7 @@ class Stream:
         retry = False
         if p is not None:
             retry = True
+            p.timer = bool(p.sent)  # not taken as lost by an ack: the timer ran out
             self._lost(now)
         elif self.queue and self.can_send():
             p = self.queue.pop(0)
@@ -197,8 +215,7 @@ class Stream:
             elif p.stream:
                 flags |= F_CONT
             b += p.data
-            if not p.first:
-                p.first = now
+            p.copies.append(now)
             p.delivered = self.delivered
             p.sent = now
             p.tries += 1
@@ -244,7 +261,17 @@ class Stream:
                 p = self.inflight.get(seq)
                 if p is None:
                     return
-                newest = max(newest, p.sent)
+                # an ack sooner than the minimum round trip after a timer's copy is for an earlier
+                # copy: the timer fired on a queue, not a loss (RFC 8985 §6.2). The newest copy's
+                # time would declare every part sent between the copies lost. The ack is not
+                # ambiguous, so it is a round-trip sample (Karn's rule skips it otherwise).
+                sent = p.sent
+                if p.timer and now - p.sent < self.min_rtt:
+                    for i, c in enumerate(p.copies):
+                        if i == 0 or now - c >= self.min_rtt:
+                            sent = c
+                    self._sample(now - sent)
+                newest = max(newest, sent)
                 self.delivered += len(p.data)
                 if p.tries == 1:
                     dt = now - p.sent
