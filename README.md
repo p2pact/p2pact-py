@@ -37,7 +37,9 @@ asyncio.run(main())
 ```
 
 `call_on` / `event_on` send on a stream (one per chat): a loss on one chat does not hold up
-the others.
+the others. A stream's calls and events run one at a time, in the order sent; a handler that
+waits long (an agent's turn, a person's answer) returns `later(awaitable)` (from `p2pact.node`):
+its stream goes on at once, and the call's result goes when the awaitable is done.
 
 Compression: `node.add_dict(COMMON_DICT)` (from `p2pact.common`) gives the common dictionary
 until a device has its own; each device trains one for every device it talks to, on that

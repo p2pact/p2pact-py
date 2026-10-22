@@ -2,6 +2,7 @@
 delivery, messages and compression. Runs on an asyncio event loop."""
 import asyncio
 import concurrent.futures
+import inspect
 import os
 import struct
 import sys
@@ -28,6 +29,25 @@ class P2PACTError(Exception):
     def __init__(self, code: int, text: str):
         super().__init__(text)
         self.code = code
+
+
+class Later:
+    """A reply taken out of the stream's turn: see later()."""
+    __slots__ = ("reply",)
+
+    def __init__(self, reply):
+        self.reply = reply
+
+
+def later(reply) -> Later:
+    """Answers a call later (spec §6): a handler returns later(reply), its turn on the stream ends
+    there, so the stream's next calls and events run (a cancel among them), and the call's result
+    or error goes when reply — an awaitable of the result values — is done, unless the caller
+    restarted meanwhile.
+
+        node.handle(1, 1, lambda peer, args: later(run_turn(args)))
+    """
+    return Later(reply)
 
 
 def _u32(b: bytes, at: int) -> int:
@@ -100,6 +120,7 @@ class Node:
         # on_event(peer, tool, ev, raw_args) receives tool events (except tool 0): in the order
         # sent on each stream, one at a time, together with that stream's calls (spec §6)
         self.on_event = self.on_paired = self.on_hello = self.allow_dict = None
+        self._later: set = set()  # replies given later (spec §6): their tasks, kept until done
         self.no_compression = False  # what we send goes uncompressed (benchmarks, debugging)
         self.no_learning = False  # do not train our own dictionaries on what we send (spec §5)
         self.trainer: concurrent.futures.ThreadPoolExecutor | None = None  # one dictionary at a time
@@ -154,7 +175,8 @@ class Node:
     def handle(self, tool: int, method: int, h):
         """h(peer, raw_args) -> list of result values (or an awaitable of it). Calls of one device
         on one stream run one at a time, in the order sent, together with its events there
-        (spec §6); other streams do not wait."""
+        (spec §6); other streams do not wait. A handler that waits long returns later(...), so
+        that the stream goes on without it."""
         self.handlers[(tool, method)] = h
 
     # --- pairing ---
@@ -499,23 +521,37 @@ class Node:
                 self._hear(ps, msg)
             boot = ps.boot
 
-            async def run():
-                if h is None:
-                    out = [2, cid, ERR_NO_METHOD, "no such method"]
-                else:
-                    try:
-                        r = h(peer, args)
-                        if asyncio.iscoroutine(r):
-                            r = await r
-                        out = [1, cid, *r]
-                    except P2PACTError as e:
-                        out = [2, cid, e.code, str(e)]
-                    except Exception as e:
-                        out = [2, cid, ERR_FAILED, str(e)]
+            async def reply(r):
+                try:
+                    if isinstance(r, Exception):
+                        raise r
+                    if inspect.isawaitable(r):
+                        r = await r
+                    out = [1, cid, *r]
+                except P2PACTError as e:
+                    out = [2, cid, e.code, str(e)]
+                except Exception as e:
+                    out = [2, cid, ERR_FAILED, str(e)]
                 # the result goes back on the call's stream, unless the caller restarted meanwhile
                 ps2 = self._peer(peer)
                 if ps2 and (boot == 0 or ps2.boot == boot):
                     self._push(ps2, encode(out), stream, tool != 0, reply=True)
+
+            async def run():
+                if h is None:
+                    return await reply(P2PACTError(ERR_NO_METHOD, "no such method"))
+                try:
+                    r = h(peer, args)
+                    if inspect.isawaitable(r) and not isinstance(r, Later):
+                        r = await r
+                except Exception as e:
+                    return await reply(e)
+                if isinstance(r, Later):  # the turn ends here; the reply goes when it is ready
+                    t = asyncio.get_running_loop().create_task(reply(r.reply))
+                    self._later.add(t)
+                    t.add_done_callback(self._later.discard)
+                    return
+                await reply(r)
             if tool == 0:  # service calls (a dictionary, a ping) never wait behind a slow handler
                 asyncio.get_running_loop().create_task(run())
             else:

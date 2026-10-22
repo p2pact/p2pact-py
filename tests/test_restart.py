@@ -4,7 +4,7 @@ import random
 
 from p2pact.cbor import decode
 from p2pact.delivery import Stream
-from p2pact.node import Node
+from p2pact.node import Node, P2PACTError, later
 
 from test_node import echo, make, pair
 
@@ -95,6 +95,50 @@ def test_order_of_events(tmp_path):
             await asyncio.wait_for(call, 10)
             assert got[-1] == 0
             assert got[:-1] == list(range(1, total))
+        finally:
+            a.close()
+            b.close()
+    asyncio.run(run())
+
+
+def test_answer_later(tmp_path):
+    """A handler that answers later lets its stream go on: an event and a call sent behind it
+    run (in the order sent) while it waits, and its result comes when ready (spec §6)."""
+    async def run():
+        a, b = await make(tmp_path, "laptop"), await make(tmp_path, "phone")
+        try:
+            await pair(a, b)
+            turn = asyncio.get_running_loop().create_future()
+            started = []
+
+            async def long(peer, args):  # an agent's turn
+                started.append("long")
+                return later(turn)
+
+            def quick(peer, args):
+                started.append("call")
+                return ["quick"]
+
+            async def refuse():
+                raise P2PACTError(4, "no")
+            b.handle(64, 2, long)
+            b.handle(64, 3, quick)
+            b.handle(64, 4, lambda peer, args: later(refuse()))  # an error, later
+            b.on_event = lambda peer, tool, ev, args: started.append("event")
+            call = asyncio.create_task(a.call_on(b.id.addr, 2, 64, 2))
+            await asyncio.sleep(0.05)
+            a.event_on(b.id.addr, 2, 64, 1)  # a cancel, say
+            res = await asyncio.wait_for(a.call_on(b.id.addr, 2, 64, 3), 3)
+            assert decode(res[0]) == "quick"
+            assert started == ["long", "event", "call"]
+            assert not call.done(), "the long call was answered before it was done"
+            turn.set_result(["done"])
+            assert decode((await asyncio.wait_for(call, 5))[0]) == "done"
+            try:
+                await asyncio.wait_for(a.call_on(b.id.addr, 2, 64, 4), 3)
+                raise AssertionError("no error")
+            except P2PACTError as e:
+                assert e.code == 4
         finally:
             a.close()
             b.close()
