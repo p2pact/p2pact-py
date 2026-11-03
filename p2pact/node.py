@@ -18,7 +18,7 @@ from .learn import History, history_path
 from .noise import Handshake
 from .plugin import ENV_INVITE, ENV_SOCKET
 from .roads import LocalRoad, TCPRoad, UDPRoad, local_supported
-from .grants import (LEVEL_READ, LEVEL_WRITE, Grant, clean_grants, default_grants, grant_level, grants_wire, is_default_grants,
+from .grants import (LEVEL_READ, LEVEL_WRITE, Grant, clean_grants, default_grants, grant_level, grants_wire,
                      parse_grants)
 from .tools import FIRST_NAMED_TOOL, FIXED_TOOLS, valid_tool_name
 from .store import PROLOGUE, Identity, Invite, Peer, Trust, hints_from_wire, hints_to_wire
@@ -322,9 +322,10 @@ class Node:
         self.set_grants(peer, [])
 
     def _grants_event(self, peer: str):
-        """Tells the device what it may use, unless that is the default it assumes."""
+        """Tells the device what it may use, unless we never set it (the default it assumes). A newcomer that
+        asked has an explicit set, even ["*", 2]: it waits for this event (spec §2)."""
         p = self.trust.get(peer)
-        if p is None or is_default_grants(p.grants):
+        if p is None or p.grants is None:
             return
         self._push(self._peer(peer), encode([3, 0, 6, grants_wire(p.grants)]))
 
@@ -471,8 +472,9 @@ class Node:
     async def join(self, inv: Invite, timeout: float = 30.0, wants=None) -> Peer:
         """Pairs using an invite, trying all its hints until one answers. wants asks for
         permissions (spec §2): what we want to use on the inviting device. Its person may narrow
-        it; the result comes back as event 0.6 (granted_by(), on_granted). None — we ask for
-        everything, as between one person's own devices."""
+        it; the result comes back as event 0.6 (granted_by(), on_granted); until the first 0.6 the
+        device grants us nothing. None — we ask for everything, as between one person's own
+        devices (everything until told)."""
         eps = []
         if self.udp:
             eps += [(self.udp, a) for a in inv.hints.get("udp", [])]
@@ -770,6 +772,8 @@ class Node:
         del self.hs[local]
         p = self._peer_from_payload(inv.key, pp, inv)
         p.local = self._is_local(frm)
+        if h.get("wants") is not None:
+            p.granted = []  # asked: nothing until the first 0.6 (spec §2)
         self.trust.put(p)
         s = _Session(p.addr, local, _u32(pkt, 5), c1, c2, now)
         self.sessions[local] = s

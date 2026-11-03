@@ -72,7 +72,8 @@ class Peer:
     # grants: what we let this device use of ours (spec §8.1); None — never set, which is
     # ["*", 2]: a person's own device uses everything. An empty list grants nothing.
     grants: list[Grant] | None = None
-    # granted: what the device lets us use of its tools (its event 0.6); None — not told, ["*", 2] as well
+    # granted: what the device lets us use of its tools (its event 0.6); None — not told, ["*", 2] as well;
+    # joined with wants: [] until the first 0.6
     granted: list[Grant] | None = None
     local: bool = False  # we reach the device over our local socket (a plugin's host, spec §3)
 

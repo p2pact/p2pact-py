@@ -277,7 +277,9 @@ class Computer:
 
     @property
     def grants(self) -> list[Grant]:
-        """What the computer lets us use of its tools, as it told us (event 0.6); everything until it says."""
+        """What the computer lets us use of its tools, as it told us (event 0.6). Paired with wants (the SDK
+        always asks): nothing until the first 0.6 arrives. A device that joined without wants has everything
+        until told."""
         return self._node.granted_by(self.id)
 
     def level(self, tool: str) -> int:

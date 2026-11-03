@@ -3,7 +3,7 @@ import asyncio
 
 from p2pact.grants import ALL_TOOLS, LEVEL_READ, LEVEL_WRITE, Grant, default_grants
 from p2pact.node import ERR_FORBIDDEN, KIND_CLIENT
-from p2pact.store import Invite
+from p2pact.store import Invite, Trust
 
 from test_grants import code
 from test_kind import eventually
@@ -92,6 +92,47 @@ def test_wants_refused(tmp_path):
             await eventually("asked", lambda: got)
             assert got == [default_grants()]
             await eventually("forgotten", lambda: a.trust.get(b.id.addr) is None)
+        finally:
+            a.close()
+            b.close()
+    asyncio.run(run())
+
+
+def test_wants_nothing_until_told(tmp_path):
+    """A newcomer that asked and is not yet answered may use nothing (kept over a restart); one that did not ask has everything."""
+    async def run():
+        a, b, c = await make(tmp_path, "Mac"), await make(tmp_path, "App"), await make(tmp_path, "Phone")
+        try:
+            release = asyncio.Event()
+
+            async def on_wants(p, wants):
+                await release.wait()
+                return [Grant("com.acme.x", LEVEL_READ)], True
+            a.on_wants = on_wants
+            b.kind = KIND_CLIENT
+            await join_wants(a, b, [Grant("com.acme.x", LEVEL_WRITE)])
+            assert b.granted_by(a.id.addr) == []
+            assert Trust(str(tmp_path / "App")).get(a.id.addr).granted == []  # kept over a restart
+            release.set()
+            await eventually("told", lambda: b.granted_by(a.id.addr) == [Grant("com.acme.x", LEVEL_READ)])
+            a.on_wants = None
+            await join_wants(a, c, None)
+            assert c.granted_by(a.id.addr) == default_grants()
+        finally:
+            a.close()
+            b.close()
+            c.close()
+    asyncio.run(run())
+
+
+def test_wants_everything_is_told(tmp_path):
+    """Asked for everything and got it: still told by 0.6, or the newcomer would wait for ever."""
+    async def run():
+        a, b = await make(tmp_path, "Mac"), await make(tmp_path, "App")
+        try:
+            b.kind = KIND_CLIENT
+            await join_wants(a, b, [Grant(ALL_TOOLS, LEVEL_WRITE)])
+            await eventually("told everything", lambda: b.trust.get(a.id.addr).granted == default_grants())
         finally:
             a.close()
             b.close()
