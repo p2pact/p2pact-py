@@ -1,6 +1,8 @@
 """Roads (spec §3): UDP (main) and TCP (fallback: a 2-byte length, then the packet)."""
 import asyncio
+import os
 import socket
+import sys
 
 from .delivery import MAX_PACKET
 
@@ -110,7 +112,7 @@ class TCPRoad:
             old.close()
         self.conns[addr] = w
         sock = w.get_extra_info("socket")
-        if sock:
+        if sock and sock.family in (socket.AF_INET, socket.AF_INET6):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         for b in self.pending.pop(addr, []):
             w.write(b)
@@ -171,3 +173,56 @@ class TCPRoad:
         for w in list(self.conns.values()):
             w.close()
         self.conns.clear()
+
+
+class LocalRoad(TCPRoad):
+    """The local socket road (spec §3): a Unix domain socket, framed as on TCP. Programs on the
+    same computer reach the node over it; only the device's own OS user may open the socket."""
+    name = "local"
+
+    def __init__(self, recv, path: str = ""):
+        super().__init__(recv)
+        self.path, self.seq = path, 0
+
+    @staticmethod
+    async def listen(path: str, recv) -> "LocalRoad":
+        """Listens at path (mode 0600); "" — dial only."""
+        road = LocalRoad(recv, path)
+        if path:
+            old = os.umask(0o177)  # no moment when others could connect
+            try:
+                road.server = await asyncio.start_unix_server(road._accept, path)
+            finally:
+                os.umask(old)
+            os.chmod(path, 0o600)
+        return road
+
+    async def _accept(self, r, w):
+        self.seq += 1  # peers of a unix socket have no address: number them
+        await self._serve(r, w, f"local-{self.seq}")
+
+    async def _dial(self, addr: str):
+        try:
+            r, w = await asyncio.wait_for(asyncio.open_unix_connection(addr), 10)
+        except (OSError, asyncio.TimeoutError):
+            self.pending.pop(addr, None)
+            return
+        await self._serve(r, w, addr)
+
+    def local_addr(self) -> str:
+        return ""
+
+    def local_addrs(self) -> list[str]:
+        return []  # a local address is no hint for another device
+
+    def close(self):
+        super().close()
+        if self.server:
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+
+
+def local_supported() -> bool:
+    return hasattr(socket, "AF_UNIX") and sys.platform != "win32"

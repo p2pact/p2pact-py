@@ -74,6 +74,7 @@ class Peer:
     grants: list[Grant] | None = None
     # granted: what the device lets us use of its tools (its event 0.6); None — not told, ["*", 2] as well
     granted: list[Grant] | None = None
+    local: bool = False  # we reach the device over our local socket (a plugin's host, spec §3)
 
     def allowed(self) -> list[Grant]:
         """What we let the device use of ours; the default if never set."""
@@ -126,7 +127,7 @@ class Trust:
                 p = Peer(j["addr"], _unb64(j["key"]), j.get("name", ""), _unb64(j.get("pair_secret", "")),
                          j.get("hints") or {}, j.get("added", 0), _unb64(j["sign_key"]) if j.get("sign_key") else None,
                          j.get("os"), j.get("via"), int(j.get("kind") or 0), _grants_from_json(j.get("grants")),
-                         _grants_from_json(j.get("granted")))
+                         _grants_from_json(j.get("granted")), bool(j.get("local")))
                 if len(p.key) == 32 and address(p.key) == p.addr:
                     self.peers[p.addr] = p
         except (OSError, ValueError, KeyError):
@@ -201,6 +202,8 @@ class Trust:
             j["grants"] = _grants_to_json(p.grants)  # null — never set (the Go implementation writes it too)
             if p.granted is not None:
                 j["granted"] = _grants_to_json(p.granted)
+            if p.local:
+                j["local"] = True
             out.append(j)
         os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
         tmp = self.path + ".tmp"  # replaced in one step: never read half-written

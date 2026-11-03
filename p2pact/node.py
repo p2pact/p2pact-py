@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import inspect
 import os
+import stat
 import struct
 import sys
 import time
@@ -15,7 +16,8 @@ from .crypto import address, random_bytes
 from .delivery import DATA_HEADER, MSG_MAX, Stream, keepalive
 from .learn import History, history_path
 from .noise import Handshake
-from .roads import TCPRoad, UDPRoad
+from .plugin import ENV_INVITE, ENV_SOCKET
+from .roads import LocalRoad, TCPRoad, UDPRoad, local_supported
 from .grants import (LEVEL_READ, LEVEL_WRITE, Grant, clean_grants, default_grants, grant_level, grants_wire, is_default_grants,
                      parse_grants)
 from .tools import FIRST_NAMED_TOOL, FIXED_TOOLS, valid_tool_name
@@ -157,6 +159,10 @@ class Node:
         self.boot = int.from_bytes(random_bytes(4), "big") or 1
         self.udp: UDPRoad | None = None
         self.tcp: TCPRoad | None = None
+        self.loc: LocalRoad | None = None  # the local socket road (spec §3)
+        self.local_path = ""  # the socket we listen on, or dial
+        # invites made for programs (plugin_invite) → the grants their install gave
+        self.invite_grants: dict[str, list[Grant]] = {}
         self.sessions: dict[int, _Session] = {}
         self.current: dict[str, _Session] = {}
         self.hs: dict[int, dict] = {}
@@ -188,6 +194,49 @@ class Node:
         """The fallback road; "" — dial only."""
         self.tcp = await TCPRoad.listen(addr, self._receive)
 
+    async def listen_local(self, path: str):
+        """Opens the local socket (spec §3) at path: a Unix domain socket readable and writable by
+        our OS user only (mode 0600). Programs on this computer (a plugin, a CLI) pair with the
+        node and talk to it over it. An old socket file nobody listens on is replaced."""
+        _need_local()
+        if not path:
+            raise P2PACTError(ERR_FAILED, "no socket path")
+        if self.loc is not None:
+            raise P2PACTError(ERR_FAILED, "the local socket is already in use")
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISSOCK(st.st_mode):
+                raise P2PACTError(ERR_FAILED, path + " is not a socket")
+            try:
+                _, w = await asyncio.wait_for(asyncio.open_unix_connection(path), 1)
+            except (OSError, asyncio.TimeoutError):
+                os.remove(path)  # nobody listens: a leftover of a crash
+            else:
+                w.close()
+                raise P2PACTError(ERR_FAILED, path + " is in use")
+        try:
+            self.loc = await LocalRoad.listen(path, self._receive)
+        except OSError as e:
+            raise P2PACTError(ERR_FAILED, str(e))
+        self.local_path = path
+
+    def use_local(self, path: str):
+        """Makes the node reach a device on this computer over its local socket at path: join()
+        and the session use it. The node does not listen."""
+        _need_local()
+        if not path:
+            raise P2PACTError(ERR_FAILED, "no socket path")
+        if self.loc is not None:
+            raise P2PACTError(ERR_FAILED, "the local socket is already in use")
+        self.loc, self.local_path = LocalRoad(self._receive), path
+
+    def _is_local(self, frm) -> bool:
+        """A packet that came over our local socket."""
+        return self.loc is not None and frm[0] is self.loc
+
     def start(self):
         async def every(dt, f):
             while True:
@@ -203,7 +252,7 @@ class Node:
             self.trainer.shutdown(wait=False, cancel_futures=True)
         for t in self.tasks:
             t.cancel()
-        for r in (self.udp, self.tcp):
+        for r in (self.udp, self.tcp, self.loc):
             if r:
                 r.close()
         for ps in self.peers.values():
@@ -372,6 +421,24 @@ class Node:
         self.invites[inv.id.hex()] = inv
         return inv
 
+    def plugin_invite(self, ttl: float, grants=()) -> Invite:
+        """The invite for a program the device starts (spec §2): single use, no hints (the
+        program reaches the device over the local socket), valid for ttl seconds, and the
+        program is granted exactly grants: the install gave them, nobody is asked. The program
+        must pair with kind KIND_PLUGIN over the local socket; it is never added to the family
+        and never reached over another road."""
+        inv = Invite(self.id.key[1], self.name, random_bytes(32), time.time() + ttl, {})
+        self.invites[inv.id.hex()] = inv
+        self.invite_grants[inv.id.hex()] = clean_grants(grants)
+        return inv
+
+    def plugin_env(self, ttl: float, grants=()) -> dict[str, str]:
+        """plugin_invite() and the environment to start the program with: P2PACT_SOCKET and
+        P2PACT_INVITE. The node must listen on its local socket."""
+        if not self.local_path or self.loc is None:
+            raise P2PACTError(ERR_FAILED, "the node does not listen on a local socket")
+        return {ENV_SOCKET: self.local_path, ENV_INVITE: str(self.plugin_invite(ttl, grants))}
+
     async def join(self, inv: Invite, timeout: float = 30.0, wants=None) -> Peer:
         """Pairs using an invite, trying all its hints until one answers. wants asks for
         permissions (spec §2): what we want to use on the inviting device. Its person may narrow
@@ -382,6 +449,8 @@ class Node:
             eps += [(self.udp, a) for a in inv.hints.get("udp", [])]
         if self.tcp:
             eps += [(self.tcp, a) for a in inv.hints.get("tcp", [])]
+        if self.loc and self.local_path:  # a device on this computer, over its socket
+            eps.append((self.loc, self.local_path))
         if not eps:
             raise P2PACTError(ERR_FAILED, "the invite has no road we can use")
         deadline = time.monotonic() + timeout
@@ -425,6 +494,8 @@ class Node:
         return encode(a)
 
     def befriend(self, p: Peer):
+        if p.kind == KIND_PLUGIN:
+            raise ValueError("a plugin is never in the family")
         if len(p.key) != 32 or address(p.key) != p.addr:
             raise ValueError("key does not match address")
         old = self.trust.get(p.addr)
@@ -571,8 +642,11 @@ class Node:
         if len(payload) < 12:
             return
         peer = address(hs.rs)
-        if not self.trust.get(peer):
+        known = self.trust.get(peer)
+        if not known:
             return  # silence to strangers
+        if known.kind == KIND_PLUGIN and not self._is_local(frm):
+            return  # a plugin is reachable over the local socket only (spec §2)
         ps = self._peer(peer)
         ts = int.from_bytes(payload[:8], "big")
         age = int(now * 1e9) - ts
@@ -666,6 +740,7 @@ class Node:
         c1, c2 = h["hs"].ciphers
         del self.hs[local]
         p = self._peer_from_payload(inv.key, pp, inv)
+        p.local = self._is_local(frm)
         self.trust.put(p)
         s = _Session(p.addr, local, _u32(pkt, 5), c1, c2, now)
         self.sessions[local] = s
@@ -687,10 +762,14 @@ class Node:
         if not h["hs"].ciphers:
             return
         c1, c2 = h["hs"].ciphers
-        del self.hs[local]
         inv = h["invite"]
-        self.invites.pop(inv.id.hex(), None)  # single use
         pp = decode(payload)
+        kind = _pair_kind(pp)
+        for_program = inv.id.hex() in self.invite_grants
+        if (kind == KIND_PLUGIN or for_program) and (kind != KIND_PLUGIN or not self._is_local(frm)):
+            return  # a plugin pairs over the local socket only, with an invite made for programs (spec §2)
+        del self.hs[local]
+        self.invites.pop(inv.id.hex(), None)  # single use
         p = self._peer_from_payload(h["hs"].rs, pp, inv, via=inv.id.hex())
         # what the newcomer may use (spec §2): without wants it asks for everything and keeps the
         # default; with them, and no on_wants to narrow them, it gets what it asked. With
@@ -701,6 +780,11 @@ class Node:
             p.grants = clean_grants(wants)
         if self.on_wants:
             ask, p.grants = True, []
+        if for_program:  # the install gave the grants: nobody is asked
+            ask, p.grants = False, clean_grants(self.invite_grants[inv.id.hex()])
+        if kind == KIND_PLUGIN:  # reachable over the local socket only
+            p.hints = {}
+        self.invite_grants.pop(inv.id.hex(), None)
         self.trust.put(p)
         s = _Session(p.addr, local, h["remote"], c2, c1, now)
         self.sessions[local] = s
@@ -904,7 +988,7 @@ class Node:
             if mine:
                 alive = mine
         if alive and not all_:
-            rank = lambda e: {"udp": 0, "tcp": 1}.get(e["ep"][0].name, 2)
+            rank = lambda e: {"udp": 0, "tcp": 1, "local": 1}.get(e["ep"][0].name, 2)
             # the road heard from last; a better kind only if heard within half a second of it
             best = max(alive, key=lambda e: e["last_recv"])
             for e in alive:
@@ -915,13 +999,19 @@ class Node:
         p = self.trust.get(peer)
         if not p:
             return out
+
+        def add(road, a):
+            e = ps.eps.setdefault(_key((road, a)), {"ep": (road, a), "last_recv": 0.0, "last_send": 0.0, "session": 0})
+            if e not in out:
+                out.append(e)
+        if p.local and self.loc and self.local_path:  # the device we dial on this computer
+            add(self.loc, self.local_path)
+        if p.kind == KIND_PLUGIN:  # reachable over the local socket only, on the connection it opened
+            return out
         for road, addrs in ((self.udp, p.hints.get("udp")), (self.tcp, p.hints.get("tcp"))):
-            if not road:
-                continue
-            for a in addrs or []:
-                e = ps.eps.setdefault(_key((road, a)), {"ep": (road, a), "last_recv": 0.0, "last_send": 0.0, "session": 0})
-                if e not in out:
-                    out.append(e)
+            if road:
+                for a in addrs or []:
+                    add(road, a)
         return out
 
     def _send_data(self, now, peer, ps, s, plain, all_):
@@ -1375,6 +1465,11 @@ class Node:
 def _init_gap(ps) -> float:
     """Retry a handshake after three measured round trips (0.25–2 s), else after a second."""
     return INIT_EVERY if ps.st.srtt == 0 else min(max(3 * ps.st.srtt, 0.25), 2.0)
+
+
+def _need_local():
+    if not local_supported():
+        raise P2PACTError(ERR_FAILED, "the local socket is not supported on Windows yet")
 
 
 def _is_int(v) -> bool:
