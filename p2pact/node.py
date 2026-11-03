@@ -172,6 +172,7 @@ class Node:
         # grants (spec §8.1): methods that check the level themselves, methods marked read
         self.level_handlers: dict[tuple[int, int], object] = {}
         self.read_methods: set[tuple[int, int]] = set()
+        self.tool_handlers: dict[int, object] = {}  # one handler for all methods of a tool (handle_tool_all)
         # on_granted(peer, grants) is called when a known device tells what we may use of its tools (event 0.6)
         self.on_granted = None
         # named tools (spec §8): name → number and back, versions
@@ -329,7 +330,8 @@ class Node:
 
     def _required_level(self, tool: int, method: int) -> int:
         """The level a call needs."""
-        if (tool, method) in self.level_handlers or (tool, method) in self.read_methods:
+        if ((tool, method) in self.level_handlers or (tool, method) in self.read_methods
+                or (tool in self.tool_handlers and (tool, method) not in self.handlers)):
             return LEVEL_READ
         return LEVEL_WRITE
 
@@ -368,6 +370,33 @@ class Node:
         if num is None:
             num = self.register_tool(name, 1)
         self.handle(num, method, h)
+
+    def handle_tool_all(self, name: str, h):
+        """Serves every method of the named tool with h(peer, level, method, raw_args) (the tool
+        is registered at version 1 if it is not yet). The node only requires read on the tool;
+        what each method needs is for h to check. Methods registered one by one with handle()
+        keep their own handlers. For a device that hosts another program's tool (spec §8.2)."""
+        self.tool_handlers[self.register_tool(name, 1)] = h
+
+    def unregister_tool(self, name: str):
+        """Takes a named tool back: it leaves the hello (sent again to the devices in session)
+        and its handlers are dropped. Registering the name again may give another number."""
+        num = self.names.pop(name, None)
+        if num is None:
+            return
+        self.numbers.pop(num, None)
+        self.versions.pop(num, None)
+        self.tool_handlers.pop(num, None)
+        for table in (self.handlers, self.level_handlers):
+            for k in [k for k in table if k[0] == num]:
+                del table[k]
+        self.read_methods = {k for k in self.read_methods if k[0] != num}
+        self._reannounce_tools()
+
+    def peer_tools(self, peer: str) -> list[str]:
+        """The named tools a device announced in its hello, sorted by name."""
+        ps = self.peers.get(peer)
+        return sorted(ps.named) if ps else []
 
     def tool_name(self, tool: int) -> str:
         """The name of a tool of ours by its number ("" — it has none: a number of the
@@ -852,6 +881,8 @@ class Node:
                 forbidden = level < self._required_level(tool, method)
             if (lh := self.level_handlers.get((tool, method))) and not forbidden:
                 h = lambda peer, args: lh(peer, level, args)
+            elif (th := self.tool_handlers.get(tool)) and h is None and not forbidden:
+                h = lambda peer, args: th(peer, level, method, args)
             if tool != 0:
                 self._hear(ps, msg)
             boot = ps.boot

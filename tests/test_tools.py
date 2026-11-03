@@ -4,10 +4,12 @@ import asyncio
 import pytest
 
 from p2pact.cbor import decode, encode
-from p2pact.node import FIRST_NAMED_TOOL, P2PACTError
+from p2pact.grants import LEVEL_READ, LEVEL_WRITE, Grant
+from p2pact.node import ERR_FORBIDDEN, FIRST_NAMED_TOOL, P2PACTError
 from p2pact.store import hints_to_wire
 from p2pact.tools import valid_tool_name
 
+from test_grants import code
 from test_kind import eventually
 from test_node import echo, make, pair
 
@@ -69,6 +71,38 @@ def test_named_tools_old_hello(tmp_path):
             a._message(b.id.addr, encode([3, 0, 2, "Old", "linux", "old-impl", {64: 1}, [], hints_to_wire({})]))
             assert a.tool_number(b.id.addr, "com.acme.one") is None
             await echo(a, b, b"numbered")
+        finally:
+            a.close()
+            b.close()
+    asyncio.run(run())
+
+
+def test_handle_tool_all(tmp_path):
+    """A hosted tool: one handler for all methods, the node requires read, the handler decides the
+    rest; the tool leaves the hello when unregistered; peer_tools lists what a device announced."""
+    async def run():
+        a, b = await make(tmp_path, "Mac"), await make(tmp_path, "Phone")
+        try:
+            def h(peer, level, method, args):
+                if method >= 10 and level < LEVEL_WRITE:
+                    raise P2PACTError(ERR_FORBIDDEN, "read only")
+                return [method]
+            a.handle_tool_all("com.acme.host", h)
+            await pair(a, b)
+            addr, me = a.id.addr, b.id.addr
+            await eventually("hello", lambda: b.tool_number(addr, "com.acme.host") is not None)
+            assert b.peer_tools(addr) == ["com.acme.host"]
+            a.set_grants(me, [Grant("com.acme.host", LEVEL_READ)])
+            call = lambda m: code(b.call_tool(addr, "com.acme.host", m))
+            assert await call(3) == 0  # read method
+            assert await call(12) == ERR_FORBIDDEN  # write method at read
+            a.set_grants(me, [Grant("com.acme.host", LEVEL_WRITE)])
+            assert await call(12) == 0
+            a.set_grants(me, [])
+            assert await call(3) == ERR_FORBIDDEN  # no grant
+            a.unregister_tool("com.acme.host")
+            await eventually("gone from hello", lambda: not b.peer_tools(addr))
+            assert not a.tool_handlers
         finally:
             a.close()
             b.close()
