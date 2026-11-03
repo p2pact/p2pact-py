@@ -11,6 +11,14 @@ implementations — checked by the interop tests in [p2pact-tests](https://githu
 Dependencies: `cryptography` (X25519, Ed25519, ChaCha20-Poly1305) and `zstandard`. Noise and
 CBOR are implemented here. asyncio, Python 3.10+.
 
+## Install
+
+```sh
+pip install p2pact
+```
+
+Python 3.10+. The client SDK is `p2pact.client`.
+
 ## Use
 
 ```python
@@ -101,6 +109,17 @@ python -m venv .venv && .venv/bin/pip install -e '.[test]'
 ```
 
 `python -m p2pact.interop` is the interop peer used by p2pact-tests.
+
+## Publishing
+
+For maintainers. `.github/workflows/publish.yml` runs on a `v*` tag (or by hand): tests, build,
+`twine check`, then upload to PyPI by Trusted Publishing (no token). Before the first tag, on
+pypi.org (Account, Publishing, add a pending publisher):
+
+- PyPI project name `p2pact`, owner `p2pact`, repository `p2pact-py`, workflow `publish.yml`,
+  environment `pypi`.
+- In the GitHub repository, create the environment `pypi` (Settings, Environments).
+- The tag must equal `v` + `version` from `pyproject.toml`: `git tag v0.1.0 && git push origin v0.1.0`.
 
 ## License
 
