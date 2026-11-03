@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"запусти тесты"}],"_meta":{"p2pact":{"mid":"m1"}}}}

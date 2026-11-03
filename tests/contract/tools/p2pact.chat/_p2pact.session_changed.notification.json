@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"_p2pact/session_changed","params":{"sessionId":"s1","cwd":"/w/proj","title":"proj","updatedAt":"2026-11-03T10:00:00Z","_meta":{"p2pact":{"agent":"claude","title":"proj","state":"idle","updatedAt":"2026-11-03T10:00:00Z"}}}}

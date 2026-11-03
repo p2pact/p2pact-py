@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"session/request_permission","params":{"sessionId":"s1","toolCall":{"toolCallId":"w1","title":"Bash: rm -rf build","kind":"execute","status":"pending"},"options":[{"optionId":"allow","name":"Разрешить","kind":"allow_once"},{"optionId":"always","name":"Разрешать всегда","kind":"allow_always"},{"optionId":"deny","name":"Запретить","kind":"reject_once"}]}}

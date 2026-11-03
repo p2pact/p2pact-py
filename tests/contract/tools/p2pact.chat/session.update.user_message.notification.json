@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"привет"},"_meta":{"p2pact":{"seq":1,"time":"2026-11-03T10:00:00Z"}}}}}

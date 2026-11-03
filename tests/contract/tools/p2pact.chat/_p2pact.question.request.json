@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"_p2pact/question","params":{"sessionId":"s1","toolCallId":"w2","questions":[{"question":"База?","header":"База","options":[{"label":"Postgres","description":"основная"},{"label":"SQLite"}]},{"question":"Что проверить?","multi":true,"options":[{"label":"Тесты"},{"label":"Линт"}]}]}}

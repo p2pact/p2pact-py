@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","result":{"protocol":"0.2","proto":1,"proto_min":1,"node":{"kind":"Node","id":"3f2a9c01d4e5b6a7","name":"MacBook Pro","os":"darwin","status":{"online":true,"working":1},"capabilities":{"agents":[{"id":"claude","type":"claude","name":"Claude Code"}],"tools":{"git":true}}}}}

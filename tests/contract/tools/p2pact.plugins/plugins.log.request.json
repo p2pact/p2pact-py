@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"plugins/log","params":{"name":"com.example.hello","lines":2}}

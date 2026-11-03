@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"device/grant","params":{"device":"Pixel","grants":[{"tool":"*","level":"write"}]}}

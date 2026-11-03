@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"session/new","params":{"cwd":"/w/app","mcpServers":[],"_meta":{"p2pact":{"agent":"codex","mid":"n1","model":"gpt-5","text":"собери проект","perms":"ask"}}}}

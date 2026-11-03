@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","result":{"sessions":[{"sessionId":"s1","cwd":"/w/proj","title":"proj","updatedAt":"2026-11-03T10:00:00Z","_meta":{"p2pact":{"agent":"claude","title":"proj","state":"working","updatedAt":"2026-11-03T10:00:00Z"}}}],"nextCursor":null}}

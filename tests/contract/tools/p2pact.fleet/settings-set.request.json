@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"settings/set","params":{"patch":{"sleep_after":15}}}

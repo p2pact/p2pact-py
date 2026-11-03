@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":true,"audio":false,"embeddedContext":true},"sessionCapabilities":{"list":{}}},"agentInfo":{"name":"nomad-code","title":"MacBook Pro","version":"1.0.0"},"authMethods":[],"_meta":{"p2pact":{"agents":[{"id":"claude","name":"Claude Code"}],"ext":1}}}}

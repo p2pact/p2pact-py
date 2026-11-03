@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","result":{"lines":[{"cmd":"older","id":"s1","run":"r1","messages":[{"seq":1,"role":"user","text":"привет","time":"2026-11-03T10:00:00Z"}],"more":false}]}}
