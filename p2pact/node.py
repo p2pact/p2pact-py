@@ -974,6 +974,17 @@ class Node:
                 args = a[3:]
                 self._inbox(ps, stream, lambda: on(peer, tool, ev, args))
 
+    async def after_events(self, peer: str, stream: int = 0):
+        """Waits until the events and calls that came from a device on a stream before now have
+        been handled (on_event ran for them). A call's result may be delivered ahead of the
+        events queued before it; a caller that needs them all waits here."""
+        ps = self._peer(peer)
+        if not ps:
+            return
+        done = asyncio.get_running_loop().create_future()
+        self._inbox(ps, stream, lambda: done.done() or done.set_result(None))
+        await done
+
     def _inbox(self, ps: _PeerState, stream: int, f):
         """Queues f behind the stream's earlier calls and events: they run one at a time, in the
         order they came (spec §6). Each stream has its own worker while it has work, so a slow
