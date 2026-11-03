@@ -16,6 +16,8 @@ from .delivery import DATA_HEADER, MSG_MAX, Stream, keepalive
 from .learn import History, history_path
 from .noise import Handshake
 from .roads import TCPRoad, UDPRoad
+from .grants import (LEVEL_READ, LEVEL_WRITE, Grant, clean_grants, grant_level, grants_wire, is_default_grants,
+                     parse_grants)
 from .tools import FIRST_NAMED_TOOL, FIXED_TOOLS, valid_tool_name
 from .store import PROLOGUE, Identity, Invite, Peer, Trust, hints_from_wire, hints_to_wire
 
@@ -154,6 +156,11 @@ class Node:
         self.invites: dict[str, Invite] = {}
         self.peers: dict[str, _PeerState] = {}
         self.handlers: dict[tuple[int, int], object] = {}
+        # grants (spec §8.1): methods that check the level themselves, methods marked read
+        self.level_handlers: dict[tuple[int, int], object] = {}
+        self.read_methods: set[tuple[int, int]] = set()
+        # on_granted(peer, grants) is called when a known device tells what we may use of its tools (event 0.6)
+        self.on_granted = None
         # named tools (spec §8): name → number and back, versions
         self.names: dict[str, int] = {}
         self.numbers: dict[int, str] = {}
@@ -165,6 +172,7 @@ class Node:
         self.handle(0, 1, lambda peer, args: [])
         self.handle(0, 2, lambda peer, args: self._info(peer))
         self.handle(0, 5, self._dict_handler)
+        self.handle(0, 6, lambda peer, args: [grants_wire(self.grants(peer))])
 
     async def listen_udp(self, addr: str):
         self.udp = await UDPRoad.listen(addr, self._receive)
@@ -202,6 +210,72 @@ class Node:
         (spec §6); other streams do not wait. A handler that waits long returns later(...), so
         that the stream goes on without it."""
         self.handlers[(tool, method)] = h
+
+    # --- grants (spec §8.1) ---
+
+    def handle_level(self, tool: int, method: int, h):
+        """Registers tool.method like handle(), for a handler that checks the level itself:
+        h(peer, level, raw_args) with level 1 (read) or 2 (write). The node only requires read.
+        For a tool whose single method carries many (chat 1.1: one P2PACT method for all of
+        ACP), where what a call needs depends on its arguments."""
+        self.level_handlers[(tool, method)] = h
+
+    def mark_read(self, tool: int, *methods: int):
+        """Declares methods of a tool as read (spec §8.1): a device with read on the tool may
+        call them. The others are write."""
+        self.read_methods.update((tool, m) for m in methods)
+
+    def grants(self, peer: str) -> list[Grant]:
+        """What we let a device use of ours (spec §8.1); [] for an unknown device."""
+        p = self.trust.get(peer)
+        return p.allowed() if p else []
+
+    def granted_by(self, peer: str) -> list[Grant]:
+        """What a device lets us use of its tools, as it told us (event 0.6 or method 0.6); the
+        default if it never did."""
+        p = self.trust.get(peer)
+        return p.offered() if p else []
+
+    def level(self, peer: str, tool: str) -> int:
+        """The level a device has on one of our tools, by name."""
+        p = self.trust.get(peer)
+        return grant_level(p.grants, tool) if p else 0
+
+    def set_grants(self, peer: str, grants):
+        """Replaces what a trusted device may use (an empty list revokes everything), keeps it
+        with the trust and tells the device with event 0.6."""
+        grants = clean_grants(grants)
+        if not self.trust.set_grants(peer, grants):
+            raise P2PACTError(ERR_FAILED, "unknown device")
+        self.event(peer, 0, 6, grants_wire(grants))
+
+    def grant(self, peer: str, tool: str, level: int):
+        """Changes one entry: the device gets level on the tool (LEVEL_READ, LEVEL_WRITE);
+        level 0 removes the entry."""
+        p = self.trust.get(peer)
+        if not p:
+            raise P2PACTError(ERR_FAILED, "unknown device")
+        grants = [g for g in p.allowed() if g.tool != tool]
+        if level > 0:
+            grants.append(Grant(tool, level))
+        self.set_grants(peer, grants)
+
+    def revoke_grants(self, peer: str):
+        """Takes everything away from a device but tool 0: it stays trusted and in session."""
+        self.set_grants(peer, [])
+
+    def _grants_event(self, peer: str):
+        """Tells the device what it may use, unless that is the default it assumes."""
+        p = self.trust.get(peer)
+        if p is None or is_default_grants(p.grants):
+            return
+        self._push(self._peer(peer), encode([3, 0, 6, grants_wire(p.grants)]))
+
+    def _required_level(self, tool: int, method: int) -> int:
+        """The level a call needs."""
+        if (tool, method) in self.level_handlers or (tool, method) in self.read_methods:
+            return LEVEL_READ
+        return LEVEL_WRITE
 
     # --- named tools (spec §8) ---
 
@@ -391,6 +465,10 @@ class Node:
         ps = self._peer(peer)
         if not ps:
             raise P2PACTError(ERR_FAILED, "unknown device")
+        if tool != 0:  # a tool's events go only to devices with at least read on it (spec §8.1)
+            p = self.trust.get(peer)
+            if grant_level(p.grants if p else None, self.tool_name(tool)) < LEVEL_READ:
+                return
         self._push(ps, encode([3, tool, ev, *args]), stream, tool != 0)
 
     def paths(self, peer: str) -> list[str]:
@@ -406,7 +484,8 @@ class Node:
 
     def _info(self, peer: str):
         """The hello (spec §6, 0.2); the dictionaries are those peer may see, by slot."""
-        tools = {t: 1 for (t, _m) in self.handlers if t != 0 and t not in self.numbers}
+        # tools whose handlers check the caller's level are tools too
+        tools = {t: 1 for (t, _m) in (*self.handlers, *self.level_handlers) if t != 0 and t not in self.numbers}
         return [self.name, _goos(), "p2pact-py", tools, self.dicts.ids(peer), hints_to_wire(self._hints()), self.kind,
                 self._named()]
 
@@ -616,6 +695,7 @@ class Node:
     def _send_info(self, peer: str):
         self.hints_sent = encode(hints_to_wire(self._hints()))  # what the devices know of us (_reannounce)
         self._push(self._peer(peer), encode([3, 0, 2, *self._info(peer)]))
+        self._grants_event(peer)
 
     def _message(self, peer: str, msg: bytes, stream: int = 0):
         try:
@@ -631,6 +711,13 @@ class Node:
         if kind == 0 and len(a) >= 4:
             cid, tool, method, args = decode(a[1]), decode(a[2]), decode(a[3]), a[4:]
             h = self.handlers.get((tool, method))
+            level, forbidden = 0, False
+            if tool != 0:  # grants (spec §8.1): tool 0 is always allowed
+                p = self.trust.get(peer)
+                level = grant_level(p.grants if p else None, self.tool_name(tool))
+                forbidden = level < self._required_level(tool, method)
+            if (lh := self.level_handlers.get((tool, method))) and not forbidden:
+                h = lambda peer, args: lh(peer, level, args)
             if tool != 0:
                 self._hear(ps, msg)
             boot = ps.boot
@@ -656,6 +743,8 @@ class Node:
                         self._push(ps2, encode(out), stream, tool != 0, reply=True)
 
             async def run():
+                if forbidden:
+                    return await reply(P2PACTError(ERR_FORBIDDEN, "forbidden"))
                 if h is None:
                     return await reply(P2PACTError(ERR_NO_METHOD, "no such method"))
                 try:
@@ -702,6 +791,12 @@ class Node:
                 self._drain(peer, ps)
                 if self.on_hello:
                     asyncio.get_running_loop().call_soon(self.on_hello, peer)
+                return
+            if tool == 0 and ev == 6 and len(a) >= 4:  # what we may use of its tools
+                if (g := parse_grants(decode(a[3]))) is not None:
+                    self.trust.set_granted(peer, g)
+                    if self.on_granted:
+                        asyncio.get_running_loop().call_soon(self.on_granted, peer, g)
                 return
             if tool == 0 and ev == 5 and len(a) >= 4:  # the dictionary list changed
                 ps.dicts, ps.lacks, ps.tried = _ids(decode(a[3])), [], []

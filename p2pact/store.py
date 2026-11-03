@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass, field
 
 from .cbor import decode, encode
+from .grants import Grant, default_grants
 from .crypto import address, ed25519_public, mac, random_bytes, x25519, x25519_keypair
 
 PROLOGUE = b"p2pact/1"
@@ -68,6 +69,29 @@ class Peer:
     os: str | None = None
     via: str | None = None
     kind: int = 0  # what the device is for (KIND_COMPUTER…); 0 — not said
+    # grants: what we let this device use of ours (spec §8.1); None — never set, which is
+    # ["*", 2]: a person's own device uses everything. An empty list grants nothing.
+    grants: list[Grant] | None = None
+    # granted: what the device lets us use of its tools (its event 0.6); None — not told, ["*", 2] as well
+    granted: list[Grant] | None = None
+
+    def allowed(self) -> list[Grant]:
+        """What we let the device use of ours; the default if never set."""
+        return default_grants() if self.grants is None else list(self.grants)
+
+    def offered(self) -> list[Grant]:
+        """What the device lets us use of its tools, as it told us; the default if it never did."""
+        return default_grants() if self.granted is None else list(self.granted)
+
+
+def _grants_to_json(g: list[Grant] | None):
+    return None if g is None else [{"tool": x.tool, "level": x.level} for x in g]
+
+
+def _grants_from_json(v) -> list[Grant] | None:
+    if not isinstance(v, list):
+        return None
+    return [Grant(str(x.get("tool", "")), int(x.get("level", 0))) for x in v if isinstance(x, dict)]
 
 
 def phone(os_: str | None) -> bool:
@@ -101,7 +125,8 @@ class Trust:
             for j in json.load(open(self.path)):
                 p = Peer(j["addr"], _unb64(j["key"]), j.get("name", ""), _unb64(j.get("pair_secret", "")),
                          j.get("hints") or {}, j.get("added", 0), _unb64(j["sign_key"]) if j.get("sign_key") else None,
-                         j.get("os"), j.get("via"), int(j.get("kind") or 0))
+                         j.get("os"), j.get("via"), int(j.get("kind") or 0), _grants_from_json(j.get("grants")),
+                         _grants_from_json(j.get("granted")))
                 if len(p.key) == 32 and address(p.key) == p.addr:
                     self.peers[p.addr] = p
         except (OSError, ValueError, KeyError):
@@ -124,6 +149,21 @@ class Trust:
         p = self.peers.get(addr)
         if p and p.kind != kind:
             p.kind = kind
+            self._save()
+
+    def set_grants(self, addr: str, grants: list[Grant]) -> bool:
+        """Stores what we let a known device use; False — no such device."""
+        p = self.peers.get(addr)
+        if not p:
+            return False
+        p.grants = list(grants)
+        self._save()
+        return True
+
+    def set_granted(self, addr: str, grants: list[Grant]):
+        """Stores what a known device told us we may use of its tools."""
+        if p := self.peers.get(addr):
+            p.granted = list(grants)
             self._save()
 
     def set_hints(self, addr: str, name: str, os_: str, h: dict):
@@ -158,6 +198,9 @@ class Trust:
                 j["via"] = p.via
             if p.kind:
                 j["kind"] = p.kind
+            j["grants"] = _grants_to_json(p.grants)  # null — never set (the Go implementation writes it too)
+            if p.granted is not None:
+                j["granted"] = _grants_to_json(p.granted)
             out.append(j)
         os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
         tmp = self.path + ".tmp"  # replaced in one step: never read half-written
