@@ -1,5 +1,6 @@
 """Interop peer for p2pact-tests: a node driven by JSON lines on stdin (see p2pact-go's
-cmd/p2pact-interop for the commands). Run: python -m p2pact.interop [data dir] [name]"""
+cmd/p2pact-interop for the commands, including kinds, named tools, grants, wants, the local
+socket and hosted tools). Run: python -m p2pact.interop [data dir] [name]"""
 import asyncio
 import base64
 import json
@@ -7,8 +8,13 @@ import sys
 import tempfile
 
 from .cbor import decode
+from .grants import Grant
 from .node import ERR_FAILED, Node, P2PACTError, later
 from .store import Invite
+
+
+def grants_in(l):
+    return [Grant(t, int(n)) for t, n in (l or [])]
 
 
 async def main():
@@ -37,6 +43,16 @@ async def main():
                 raise P2PACTError(ERR_FAILED, "no call came behind")
             return [data]
         return later(answer())
+    own_tools = {}
+    events = []
+
+    def echo_tool(peer, args):
+        return [decode(args[0])]
+
+    def on_event(peer, tool, ev, args):
+        events.append({"peer": peer, "tool": node.peer_tool_name(peer, tool), "event": ev,
+                       "data": base64.b64encode(decode(args[0])).decode() if args else ""})
+    node.on_event = on_event
     node.handle(64, 1, echo)
     node.handle(64, 2, hold)
     node.start()
@@ -66,7 +82,8 @@ async def main():
             elif cmd == "invite":
                 say({"invite": str(node.invite(600))})
             elif cmd == "join":
-                p = await node.join(Invite.parse(req["invite"]), 15)
+                wants = grants_in(req["wants"]) if req.get("wants") is not None else None
+                p = await node.join(Invite.parse(req["invite"]), 15, wants)
                 say({"peer": p.addr})
             elif cmd == "known":
                 say({"known": node.trust.get(req["peer"]) is not None})
@@ -91,6 +108,67 @@ async def main():
                 own, using, training = node.dict_state(req["peer"])
                 b64 = lambda x: base64.b64encode(x).decode() if x else None
                 say({"own": b64(own), "using": b64(using), "training": training})
+            elif cmd == "kind":
+                node.kind = int(req["kind"])
+                say({"ok": True})
+            elif cmd == "peer-info":
+                p = node.trust.get(req["peer"])
+                num = node.tool_number(req["peer"], req["tool"]) if req.get("tool") else None
+                say({"kind": p.kind if p else 0, "tools": node.peer_tools(req["peer"]), "number": num})
+            elif cmd == "tool":
+                name = req["name"]
+                num = node.register_tool(name, 1)
+                own_tools[name] = num
+                node.handle_tool(name, 1, echo_tool)
+                node.handle_tool(name, 2, echo_tool)
+                node.handle_tool(name, 3, lambda peer, args, name=name: [name.encode()])
+                node.mark_read(num, 1, 3)
+                say({"number": num})
+            elif cmd == "call-tool":
+                try:
+                    res = await asyncio.wait_for(node.call_tool_on(req["peer"], int(req.get("stream", 0)), req["name"], int(req["method"]),
+                                                                   base64.b64decode(req["data"])), 60)
+                except P2PACTError as e:
+                    say({"error": str(e) or type(e).__name__, "code": e.code})
+                    continue
+                say({"data": base64.b64encode(decode(res[0])).decode()})
+            elif cmd == "grant":
+                node.grant(req["peer"], req["tool"], int(req["level"]))
+                say({"ok": True})
+            elif cmd == "set-grants":
+                node.set_grants(req["peer"], grants_in(req.get("grants")))
+                say({"ok": True})
+            elif cmd == "grants":
+                out = lambda g: [[x.tool, x.level] for x in g]
+                say({"allowed": out(node.grants(req["peer"])), "granted": out(node.granted_by(req["peer"]))})
+            elif cmd == "emit":
+                node.event(req["peer"], own_tools[req["name"]], int(req["event"]), base64.b64decode(req["data"]))
+                say({"ok": True})
+            elif cmd == "events":
+                say({"events": events})
+            elif cmd == "on-wants":
+                cap = int(req["level"])
+                node.on_wants = lambda p, wants: ([Grant(g.tool, min(g.level, cap)) for g in wants], True)
+                say({"ok": True})
+            elif cmd == "local":
+                if req.get("listen"):
+                    await node.listen_local(req["listen"])
+                else:
+                    node.use_local(req["use"])
+                say({"ok": True})
+            elif cmd == "plugin-env":
+                env = node.plugin_env(600, grants_in(req.get("grants")))
+                say({"socket": env["P2PACT_SOCKET"], "invite": env["P2PACT_INVITE"]})
+            elif cmd == "proxy":
+                name, plugin = req["name"], req["plugin"]
+
+                async def forward(peer, level, method, args, name=name, plugin=plugin):
+                    if method == 2 and level < 2:
+                        raise P2PACTError(4, "forbidden")
+                    res = await node.call_tool(plugin, name, method, *[decode(a) for a in args])
+                    return [decode(r) for r in res]
+                node.handle_tool_all(name, forward)
+                say({"ok": True})
             elif cmd == "close":
                 break
             else:
