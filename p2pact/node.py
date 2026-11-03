@@ -16,7 +16,7 @@ from .delivery import DATA_HEADER, MSG_MAX, Stream, keepalive
 from .learn import History, history_path
 from .noise import Handshake
 from .roads import TCPRoad, UDPRoad
-from .grants import (LEVEL_READ, LEVEL_WRITE, Grant, clean_grants, grant_level, grants_wire, is_default_grants,
+from .grants import (LEVEL_READ, LEVEL_WRITE, Grant, clean_grants, default_grants, grant_level, grants_wire, is_default_grants,
                      parse_grants)
 from .tools import FIRST_NAMED_TOOL, FIXED_TOOLS, valid_tool_name
 from .store import PROLOGUE, Identity, Invite, Peer, Trust, hints_from_wire, hints_to_wire
@@ -135,6 +135,13 @@ class Node:
         # on_event(peer, tool, ev, raw_args) receives tool events (except tool 0): in the order
         # sent on each stream, one at a time, together with that stream's calls (spec §6)
         self.on_event = self.on_paired = self.on_hello = self.allow_dict = None
+        # on_wants(peer, wants) -> (grants, ok) is called on the inviting device when a newcomer
+        # has paired (spec §2), with what it asks to use (everything, if it did not say): the
+        # application shows it to its person and returns what the newcomer is granted, or ok
+        # False to refuse (the newcomer is forgotten). It may be a coroutine function and wait
+        # for the person; the newcomer can use nothing meanwhile. on_paired follows when it
+        # accepts. None — the newcomer gets what it asked for.
+        self.on_wants = None
         # on_held(peer, held) is called when messages from a device waited too long for a
         # dictionary or its list and were dropped (held — how many): the application can tell
         # the user or resend
@@ -365,7 +372,11 @@ class Node:
         self.invites[inv.id.hex()] = inv
         return inv
 
-    async def join(self, inv: Invite, timeout: float = 30.0) -> Peer:
+    async def join(self, inv: Invite, timeout: float = 30.0, wants=None) -> Peer:
+        """Pairs using an invite, trying all its hints until one answers. wants asks for
+        permissions (spec §2): what we want to use on the inviting device. Its person may narrow
+        it; the result comes back as event 0.6 (granted_by(), on_granted). None — we ask for
+        everything, as between one person's own devices."""
         eps = []
         if self.udp:
             eps += [(self.udp, a) for a in inv.hints.get("udp", [])]
@@ -382,7 +393,8 @@ class Node:
             msg1 = hs.write_message()
             local = self._new_index()
             done = loop.create_future()
-            self.hs[local] = {"pair": True, "hs": hs, "invite": inv, "done": done, "at": time.time(), "early": []}
+            self.hs[local] = {"pair": True, "hs": hs, "invite": inv, "done": done, "at": time.time(), "early": [],
+                             "wants": wants}
             pkt = bytes((P_PAIR1,)) + inv.id + _be32(local) + msg1
             for road, a in eps:
                 road.send(a, pkt)
@@ -397,12 +409,19 @@ class Node:
                     self.hs.pop(local, None)
                     raise P2PACTError(ERR_FAILED, "pairing timed out")
 
-    def _pair_payload(self) -> bytes:
-        """[name, boot, hints, signing key, os, kind]: the kind is left out if we do not say one
-        (an older device gets what it knows)."""
+    async def join_wants(self, inv: Invite, wants, timeout: float = 30.0) -> Peer:
+        """join() asking for permissions (spec §2, `wants`)."""
+        return await self.join(inv, timeout, wants)
+
+    def _pair_payload(self, wants=None) -> bytes:
+        """[name, boot, hints, signing key, os, kind, wants]. wants are what we ask to use (None
+        — not asking, the field is left out, and so is the kind if we do not say one: an older
+        device gets what it knows)."""
         a = [self.name, self.boot, hints_to_wire(self._hints()), self.id.sign_public, _goos()]
-        if self.kind != KIND_UNKNOWN:
+        if self.kind != KIND_UNKNOWN or wants is not None:
             a.append(self.kind)
+        if wants is not None:
+            a.append(grants_wire(clean_grants(wants)))
         return encode(a)
 
     def befriend(self, p: Peer):
@@ -643,7 +662,7 @@ class Node:
                 h["done"].set_exception(P2PACTError(ERR_FAILED, "device key does not match the invite"))
             return
         pp = decode(payload)
-        msg3 = h["hs"].write_message(self._pair_payload())
+        msg3 = h["hs"].write_message(self._pair_payload(h.get("wants")))
         c1, c2 = h["hs"].ciphers
         del self.hs[local]
         p = self._peer_from_payload(inv.key, pp, inv)
@@ -673,6 +692,15 @@ class Node:
         self.invites.pop(inv.id.hex(), None)  # single use
         pp = decode(payload)
         p = self._peer_from_payload(h["hs"].rs, pp, inv, via=inv.id.hex())
+        # what the newcomer may use (spec §2): without wants it asks for everything and keeps the
+        # default; with them, and no on_wants to narrow them, it gets what it asked. With
+        # on_wants the application decides: until it does the newcomer may use nothing.
+        wants = parse_grants(pp[6]) if len(pp) > 6 else None
+        ask = False
+        if wants is not None:
+            p.grants = clean_grants(wants)
+        if self.on_wants:
+            ask, p.grants = True, []
         self.trust.put(p)
         s = _Session(p.addr, local, h["remote"], c2, c1, now)
         self.sessions[local] = s
@@ -680,7 +708,29 @@ class Node:
         ps = self._peer(p.addr)
         self._seen(ps, frm, now, s.local)
         self._boot(ps, int(pp[1] or 0))
+        if ask:
+            self._send_info(p.addr)
+            asyncio.get_running_loop().create_task(self._decide_wants(p, clean_grants(wants) if wants is not None
+                                                                       else default_grants()))
+            return
         self._paired(p)
+
+    async def _decide_wants(self, p: Peer, wants: list[Grant]):
+        try:
+            r = self.on_wants(p, wants)
+            if inspect.isawaitable(r):
+                r = await r
+            grants, ok = r
+        except Exception:
+            ok = False  # an application that fails refuses
+        if not ok:
+            self.forget(p.addr)
+            return
+        if not self.trust.get(p.addr):
+            return  # forgotten while the person was deciding
+        self.set_grants(p.addr, grants)
+        if self.on_paired:
+            self.on_paired(self.trust.get(p.addr))
 
     def _paired(self, p: Peer):
         self._send_info(p.addr)
