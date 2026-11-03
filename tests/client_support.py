@@ -16,7 +16,7 @@ CHAT_READ = {"initialize", "session/list", "session/load", "_p2pact/older", "_p2
              "_p2pact/history", "_p2pact/projects", "_p2pact/agents", "_p2pact/image", "_p2pact/diff"}
 FLEET_READ = {"fleet/hello", "node/get", "session/list", "session/get", "session/messages", "fleet/watch",
               "fleet/unwatch"}
-PLUGINS_READ = {"plugins/list", "plugins/log", "plugins/grants"}
+PLUGINS_READ = {"plugins/list", "plugins/log", "plugins/grants", "plugins/watch", "plugins/unwatch"}
 
 
 def fixture_exists(dir_: str, name: str) -> bool:
@@ -121,6 +121,8 @@ class FakeEngine:
 
     def _plugins(self, method, params):
         stem = method.replace("/", ".")
+        if method == "plugins/log" and params.get("name") == "com.example.nope":
+            stem = "plugins.log.unknown"
         if fixture_exists("p2pact.plugins", stem + ".response"):
             return fixture("p2pact.plugins", stem + ".response")
         return {"jsonrpc": "2.0", "error": {"code": -32601, "message": "no method " + method}}

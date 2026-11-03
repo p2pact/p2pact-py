@@ -1,10 +1,10 @@
 """p2pact.client: the plugins tool and hosted tools against a fake computer."""
 import pytest
 
-from p2pact.client import DEFAULT_WANTS, ForbiddenError, NoMethodError, PluginStatus
+from p2pact.client import DEFAULT_WANTS, ForbiddenError, NoMethodError, PluginChanged, PluginStatus, RpcError
 from p2pact.grants import LEVEL_READ, LEVEL_WRITE, Grant
 
-from client_support import Rig, assert_sent
+from client_support import Rig, assert_sent, fixture
 
 WANTS = DEFAULT_WANTS + [Grant("com.example.hello", LEVEL_WRITE)]
 
@@ -53,3 +53,41 @@ async def test_tool_grant_is_needed(tmp_path):
         computer = await rig.connect()  # no grant on the hosted tool
         with pytest.raises(ForbiddenError):
             await computer.call_tool("com.example.hello", 1, "x")
+
+
+async def test_grants_level_int_is_accepted(tmp_path):
+    async with Rig(tmp_path) as rig:
+        plugins = (await rig.connect(WANTS)).plugins
+        rig.engine.overrides["4:plugins/grants"] = lambda p: {"jsonrpc": "2.0", "result": {
+            "name": "x", "grants": [{"tool": "a", "level": 2}, {"tool": "b", "level": "write"},
+                                    {"tool": "c", "level": "nope"}], "read": {}}}
+        g = await plugins.grants("x")
+        assert g.grants == [Grant("a", LEVEL_WRITE), Grant("b", LEVEL_WRITE)]
+
+
+async def test_unknown_plugin_log_is_an_error(tmp_path):
+    async with Rig(tmp_path) as rig:
+        plugins = (await rig.connect(WANTS)).plugins
+        with pytest.raises(RpcError) as e:
+            await plugins.log("com.example.nope")
+        assert e.value.code == -32004
+
+
+async def test_watch_delivers_changed_and_unwatch(tmp_path):
+    async with Rig(tmp_path) as rig:
+        plugins = (await rig.connect(WANTS)).plugins
+        events = plugins.events.stream()
+        (p,) = await plugins.watch()
+        assert p.name == "com.example.hello"
+        assert_sent(rig.engine, 4, "plugins/watch", "p2pact.plugins", "plugins.watch.request")
+
+        rig.engine.notify(4, fixture("p2pact.plugins", "plugins.changed.notification"))
+        rig.engine.notify(4, fixture("p2pact.plugins", "plugins.changed.removed.notification"))
+        ev = await events.next(10)
+        assert isinstance(ev, PluginChanged) and not ev.removed
+        assert (ev.plugin.name, ev.plugin.status, ev.plugin.pid) == ("com.example.hello", PluginStatus.RUNNING, 4242)
+        ev = await events.next(10)
+        assert ev.removed and ev.plugin.status == PluginStatus.STOPPED
+
+        await plugins.unwatch()
+        assert_sent(rig.engine, 4, "plugins/unwatch", "p2pact.plugins", "plugins.unwatch.request")

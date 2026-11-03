@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"plugins/changed","params":{"name":"com.example.hello","version":"1.0.0","title":"Hello","enabled":true,"status":"stopped","restarts":0,"tools":["com.example.hello"],"announced":[],"needs":["p2pact.chat:read"],"removed":true}}

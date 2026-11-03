@@ -158,6 +158,8 @@ class P2pactClient:
             c.chat._notified(args)
         elif tool == FLEET_TOOL and ev == 1:
             c.fleet._notified(args)
+        elif tool == PLUGINS_TOOL and ev == 1:
+            c.plugins._notified(args)
         elif tool == PLUGINS_TOOL:
             pass
         else:
@@ -302,6 +304,7 @@ class Computer:
         self.owner._reset_event_numbers(self.id)
         self.chat._reconnected()
         self.fleet._reconnected()
+        self.plugins._reconnected()
         self._ready.set()
         self.owner.computer_events.emit(Online(self))
 

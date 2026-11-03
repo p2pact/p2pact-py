@@ -20,5 +20,5 @@ from .models import (AgentInfo, AgentMessage, AgentThought, ChatMessage, ChatSes
                      OlderPage, OtherUpdate, PermissionOption, PermissionOutcome, PermissionRequest, Plan, PlanEntry,
                      PromptResult, Question, QuestionOption, QuestionRequest, RequestAnswered, SessionList,
                      SessionState, ToolCall, ToolCallInfo, ToolCallUpdate, UserMessage)
-from .plugins import PluginGrants, PluginInfo, PluginsClient, PluginStatus
+from .plugins import PluginChanged, PluginGrants, PluginInfo, PluginsClient, PluginStatus
 from .util import Events, EventStream, Subscription, stream_of

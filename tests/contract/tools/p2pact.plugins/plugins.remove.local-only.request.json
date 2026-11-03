@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"plugins/remove","params":{"name":"com.example.hello"}}
