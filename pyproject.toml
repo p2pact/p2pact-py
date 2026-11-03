@@ -20,7 +20,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["p2pact"]
+packages = ["p2pact", "p2pact.client"]
 
 [tool.setuptools.package-data]
 p2pact = ["*.zdict"]
