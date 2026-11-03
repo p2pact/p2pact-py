@@ -67,6 +67,7 @@ class Peer:
     sign_key: bytes | None = None
     os: str | None = None
     via: str | None = None
+    kind: int = 0  # what the device is for (KIND_COMPUTER…); 0 — not said
 
 
 def phone(os_: str | None) -> bool:
@@ -100,7 +101,7 @@ class Trust:
             for j in json.load(open(self.path)):
                 p = Peer(j["addr"], _unb64(j["key"]), j.get("name", ""), _unb64(j.get("pair_secret", "")),
                          j.get("hints") or {}, j.get("added", 0), _unb64(j["sign_key"]) if j.get("sign_key") else None,
-                         j.get("os"), j.get("via"))
+                         j.get("os"), j.get("via"), int(j.get("kind") or 0))
                 if len(p.key) == 32 and address(p.key) == p.addr:
                     self.peers[p.addr] = p
         except (OSError, ValueError, KeyError):
@@ -117,6 +118,13 @@ class Trust:
             p.added = int(time.time() * 1000)
         self.peers[p.addr] = p
         self._save()
+
+    def set_kind(self, addr: str, kind: int):
+        """Stores the kind a device told in its hello."""
+        p = self.peers.get(addr)
+        if p and p.kind != kind:
+            p.kind = kind
+            self._save()
 
     def set_hints(self, addr: str, name: str, os_: str, h: dict):
         p = self.peers.get(addr)
@@ -148,6 +156,8 @@ class Trust:
                 j["os"] = p.os
             if p.via:
                 j["via"] = p.via
+            if p.kind:
+                j["kind"] = p.kind
             out.append(j)
         os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
         tmp = self.path + ".tmp"  # replaced in one step: never read half-written

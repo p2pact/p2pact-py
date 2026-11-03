@@ -26,6 +26,13 @@ HOLD_ASK, HOLD_DROP = 15.0, 120.0  # held messages: ask again, then drop them (_
 ERR_NO_METHOD, ERR_BAD_ARGS, ERR_NOT_FOUND, ERR_FORBIDDEN, ERR_FAILED, ERR_NOT_DELIVERED = 1, 2, 3, 4, 5, 6
 
 
+# Kinds of device (spec §1): what a device is for, told in the pairing payload and the hello.
+KIND_UNKNOWN = 0  # not said (an older device): guess as before, e.g. by OS
+KIND_COMPUTER = 1  # runs agents, serves tools
+KIND_CLIENT = 2  # an app a person holds: a phone, a desktop or web app
+KIND_PLUGIN = 3  # a program on the same computer that adds tools to it
+
+
 class P2PACTError(Exception):
     def __init__(self, code: int, text: str):
         super().__init__(text)
@@ -133,6 +140,7 @@ class Node:
         self._later: set = set()  # replies given later (spec §6): their tasks, kept until done
         self.no_compression = False  # what we send goes uncompressed (benchmarks, debugging)
         self.no_learning = False  # do not train our own dictionaries on what we send (spec §5)
+        self.kind = KIND_UNKNOWN  # what this device is for, told in pairing and the hello (spec §1)
         self.trainer: concurrent.futures.ThreadPoolExecutor | None = None  # one dictionary at a time
         self.closed = False
         self.boot = int.from_bytes(random_bytes(4), "big") or 1
@@ -229,7 +237,12 @@ class Node:
                     raise P2PACTError(ERR_FAILED, "pairing timed out")
 
     def _pair_payload(self) -> bytes:
-        return encode([self.name, self.boot, hints_to_wire(self._hints()), self.id.sign_public, _goos()])
+        """[name, boot, hints, signing key, os, kind]: the kind is left out if we do not say one
+        (an older device gets what it knows)."""
+        a = [self.name, self.boot, hints_to_wire(self._hints()), self.id.sign_public, _goos()]
+        if self.kind != KIND_UNKNOWN:
+            a.append(self.kind)
+        return encode(a)
 
     def befriend(self, p: Peer):
         if len(p.key) != 32 or address(p.key) != p.addr:
@@ -237,6 +250,8 @@ class Node:
         old = self.trust.get(p.addr)
         if old:
             old.name, old.sign_key, old.os = p.name, p.sign_key, p.os
+            if p.kind != KIND_UNKNOWN:
+                old.kind = p.kind
             self.trust.put(old)
             return
         p.pair_secret = self.id.shared(p.key, "family-pair")
@@ -305,7 +320,7 @@ class Node:
     def _info(self, peer: str):
         """The hello (spec §6, 0.2); the dictionaries are those peer may see, by slot."""
         tools = {t: 1 for (t, _m) in self.handlers if t != 0}
-        return [self.name, _goos(), "p2pact-py", tools, self.dicts.ids(peer), hints_to_wire(self._hints())]
+        return [self.name, _goos(), "p2pact-py", tools, self.dicts.ids(peer), hints_to_wire(self._hints()), self.kind]
 
     def _hints(self) -> dict:
         h = {}
@@ -441,7 +456,7 @@ class Node:
                     hints[k] = inv.hints[k]
         return Peer(address(key), bytes(key), str(pp[0] or ""), inv.secret, hints, 0,
                     pp[3] if len(pp) > 3 and isinstance(pp[3], bytes) else None,
-                    pp[4] if len(pp) > 4 and isinstance(pp[4], str) else None, via)
+                    pp[4] if len(pp) > 4 and isinstance(pp[4], str) else None, via, _pair_kind(pp))
 
     def _on_pair2(self, now, pkt, frm):
         if len(pkt) < 9:
@@ -587,6 +602,8 @@ class Node:
             tool, ev = decode(a[1]), decode(a[2])
             if tool == 0 and ev == 2 and len(a) >= 9:
                 self.trust.set_hints(peer, str(decode(a[3]) or ""), str(decode(a[4]) or ""), hints_from_wire(decode(a[8])))
+                if len(a) >= 10 and _is_int(k := decode(a[9])):
+                    self.trust.set_kind(peer, k)
                 ps.dicts, ps.lacks, ps.tried = _ids(decode(a[7])), [], []
                 self._fetch_new(peer, ps)
                 self._drain(peer, ps)
@@ -1120,6 +1137,14 @@ class Node:
 def _init_gap(ps) -> float:
     """Retry a handshake after three measured round trips (0.25–2 s), else after a second."""
     return INIT_EVERY if ps.st.srtt == 0 else min(max(3 * ps.st.srtt, 0.25), 2.0)
+
+
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _pair_kind(pp) -> int:
+    return pp[5] if len(pp) > 5 and _is_int(pp[5]) else KIND_UNKNOWN
 
 
 def _ids(v) -> list[bytes]:
