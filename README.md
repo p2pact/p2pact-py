@@ -62,6 +62,32 @@ conversation only, in the background (`no_learning = True` turns that off).
   program with; the program calls `node, host = await new_plugin(data_dir, name)` (from
   `p2pact.plugin`). See `examples/plugin_hello`.
 
+## Client SDK (`p2pact.client`)
+
+A typed asyncio client of the public tools (chat, fleet, plugins) for applications that talk to a
+computer running the P2PACT engine (the same shape as `p2pact-client` for Kotlin):
+
+```python
+from p2pact.client import P2pactClient, AgentMessage
+
+async with await P2pactClient.open("./data", "My app") as client:
+    computer = await client.pair("p2pact1.…")      # asks for chat, fleet, plugins:read
+    await computer.when_online()
+    for s in await computer.chat.list_all_sessions():
+        print(s.id, s.state.value, s.title)
+    computer.chat.permission_handler = lambda r: r.allow()      # sync or async
+    computer.chat.updates.subscribe(lambda u: isinstance(u, AgentMessage) and print(u.text))
+    await computer.chat.prompt("s1", "run the tests")           # ends with the agent's turn
+
+    async for e in computer.fleet.events.stream():              # after `await computer.fleet.watch()`
+        print(e)
+```
+
+Calls are coroutines; they raise `ForbiddenError` (and the other `CallError`s, by P2PACT error code)
+or `RpcError` (the tool's own JSON-RPC error). Events are `Events` objects: `subscribe(callback)` or
+`stream()` as an async iterator. `computer.grants` / `level()` / `can_write()` tell what the person at
+the computer allowed. See `examples/client_cli`.
+
 ## Status
 
 Pairing, sessions, UDP and TCP roads, delivery with congestion control, messages,
