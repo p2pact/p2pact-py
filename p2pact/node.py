@@ -16,6 +16,7 @@ from .delivery import DATA_HEADER, MSG_MAX, Stream, keepalive
 from .learn import History, history_path
 from .noise import Handshake
 from .roads import TCPRoad, UDPRoad
+from .tools import FIRST_NAMED_TOOL, FIXED_TOOLS, valid_tool_name
 from .store import PROLOGUE, Identity, Invite, Peer, Trust, hints_from_wire, hints_to_wire
 
 P_INIT, P_RESP, P_PAIR1, P_PAIR2, P_PAIR3, P_DATA, P_RESET = 1, 2, 3, 4, 5, 6, 7
@@ -119,6 +120,7 @@ class _PeerState:
         self.queued = 0
         self.last_talk = 0.0
         self.inbox: dict[int, list] = {}  # calls and events waiting for their turn, per stream
+        self.named: dict[str, tuple[int, int]] = {}  # its named tools {name: (number, version)}, from its hello (spec §8)
 
 
 class Node:
@@ -152,6 +154,10 @@ class Node:
         self.invites: dict[str, Invite] = {}
         self.peers: dict[str, _PeerState] = {}
         self.handlers: dict[tuple[int, int], object] = {}
+        # named tools (spec §8): name → number and back, versions
+        self.names: dict[str, int] = {}
+        self.numbers: dict[int, str] = {}
+        self.versions: dict[int, int] = {}
         self.reset_at: dict[str, float] = {}
         self.tasks: list[asyncio.Task] = []
         self.woken = False
@@ -196,6 +202,87 @@ class Node:
         (spec §6); other streams do not wait. A handler that waits long returns later(...), so
         that the stream goes on without it."""
         self.handlers[(tool, method)] = h
+
+    # --- named tools (spec §8) ---
+
+    def register_tool(self, name: str, version: int = 1) -> int:
+        """Gives a tool of ours a name and picks its number: the first one from 64 up that no
+        other tool of ours uses. The same name keeps its number for the rest of the run. The
+        number is announced in the hello's named map, and the devices in session get the new
+        hello at once. Other devices may number the same name differently: callers use
+        tool_number()."""
+        if not valid_tool_name(name):
+            raise ValueError("bad tool name: " + name)
+        if (num := self.names.get(name)) is not None:
+            if self.versions[num] != version:
+                self.versions[num] = version
+                self._reannounce_tools()
+            return num
+        num = FIRST_NAMED_TOOL
+        while self._tool_used(num):
+            num += 1
+        self.names[name], self.numbers[num], self.versions[num] = num, name, version
+        self._reannounce_tools()
+        return num
+
+    def _tool_used(self, num: int) -> bool:
+        return num in self.numbers or any(t == num for (t, _m) in self.handlers)
+
+    def _reannounce_tools(self):
+        for peer in list(self.current):
+            self._send_info(peer)
+
+    def handle_tool(self, name: str, method: int, h):
+        """handle() by tool name (the tool is registered at version 1 if it is not yet)."""
+        num = FIXED_TOOLS.get(name)
+        if num is None:
+            num = self.register_tool(name, 1)
+        self.handle(num, method, h)
+
+    def tool_name(self, tool: int) -> str:
+        """The name of a tool of ours by its number ("" — it has none: a number of the
+        implementation's own)."""
+        for name, num in FIXED_TOOLS.items():
+            if num == tool:
+                return name
+        return self.numbers.get(tool, "")
+
+    def tool_number(self, peer: str, name: str) -> int | None:
+        """Resolves a tool name to the number the device announced for it in its hello (spec
+        §8); the tools of the spec have their fixed numbers. None — the device has not announced
+        it (or we have not heard its hello yet)."""
+        if (num := FIXED_TOOLS.get(name)) is not None:
+            return num
+        ps = self.peers.get(peer)
+        ref = ps.named.get(name) if ps else None
+        return ref[0] if ref else None
+
+    def peer_tool_name(self, peer: str, tool: int) -> str:
+        """The name of a tool of a device by the number it announced: what an on_event handler
+        needs ("" — unnamed)."""
+        for name, num in FIXED_TOOLS.items():
+            if num == tool:
+                return name
+        ps = self.peers.get(peer)
+        for name, ref in (ps.named.items() if ps else ()):
+            if ref[0] == tool:
+                return name
+        return ""
+
+    async def call_tool(self, peer: str, name: str, method: int, *args) -> list[bytes]:
+        """call() by tool name: the number is the device's own."""
+        return await self.call_tool_on(peer, 0, name, method, *args)
+
+    async def call_tool_on(self, peer: str, stream: int, name: str, method: int, *args) -> list[bytes]:
+        """call_on() by tool name."""
+        num = self.tool_number(peer, name)
+        if num is None:
+            raise P2PACTError(ERR_NO_METHOD, "the device has no tool " + name)
+        return await self.call_on(peer, stream, num, method, *args)
+
+    def _named(self) -> dict:
+        """The hello's named map: {name: [tool, version]}."""
+        return {name: [num, self.versions[num]] for name, num in self.names.items()}
 
     # --- pairing ---
 
@@ -319,8 +406,9 @@ class Node:
 
     def _info(self, peer: str):
         """The hello (spec §6, 0.2); the dictionaries are those peer may see, by slot."""
-        tools = {t: 1 for (t, _m) in self.handlers if t != 0}
-        return [self.name, _goos(), "p2pact-py", tools, self.dicts.ids(peer), hints_to_wire(self._hints()), self.kind]
+        tools = {t: 1 for (t, _m) in self.handlers if t != 0 and t not in self.numbers}
+        return [self.name, _goos(), "p2pact-py", tools, self.dicts.ids(peer), hints_to_wire(self._hints()), self.kind,
+                self._named()]
 
     def _hints(self) -> dict:
         h = {}
@@ -604,6 +692,11 @@ class Node:
                 self.trust.set_hints(peer, str(decode(a[3]) or ""), str(decode(a[4]) or ""), hints_from_wire(decode(a[8])))
                 if len(a) >= 10 and _is_int(k := decode(a[9])):
                     self.trust.set_kind(peer, k)
+                ps.named = {}
+                if len(a) >= 11 and isinstance(named := decode(a[10]), dict):
+                    for nm, v in named.items():
+                        if isinstance(nm, str) and isinstance(v, list) and len(v) >= 2 and _is_int(v[0]) and _is_int(v[1]):
+                            ps.named[nm] = (v[0], v[1])
                 ps.dicts, ps.lacks, ps.tried = _ids(decode(a[7])), [], []
                 self._fetch_new(peer, ps)
                 self._drain(peer, ps)
