@@ -15,6 +15,8 @@ from .errors import (BadArgsError, CallError, FailedError, ForbiddenError, NoMet
 from .fleet import (CloseResult, FleetClient, FleetEvent, FleetHello, FleetMessage, FleetMessages, FleetNode,
                     FleetSession, FleetWatch, Notify, OtherEvent, Partial, Resync, SessionMessages, SessionSpec,
                     SessionsChanged)
+from .models import (AgentOption, AgentsResult, ChatCommand, CommandArg, HistoryItem, HistoryPage, OpResult,
+                     ProjectsResult)
 from .models import (AgentInfo, AgentMessage, AgentThought, ChatMessage, ChatSession, ChatUpdate, ContentBlock,
                      DiffFile, DiffResult, ImageResult, InitializeResult, LoadedSession, ModeChanged, NewSession,
                      OlderPage, OtherUpdate, PermissionOption, PermissionOutcome, PermissionRequest, Plan, PlanEntry,

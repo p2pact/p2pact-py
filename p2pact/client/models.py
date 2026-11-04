@@ -33,6 +33,7 @@ class InitializeResult:
     agents: list[AgentInfo]  # the agents the computer can start; the first is the default
     extensions: bool  # the computer speaks the `_p2pact/<name>` extensions
     raw: JsonMap = field(default_factory=dict, repr=False)
+    v: int = 0  # the extension results level the computer speaks (2: complete typed results)
 
     @staticmethod
     def parse(m: JsonMap) -> "InitializeResult":
@@ -42,7 +43,7 @@ class InitializeResult:
         return InitializeResult(
             jint(m, "protocolVersion") or 1, jstr(info, "name"), jstr(info, "title"), jstr(info, "version"),
             bool(jbool(caps, "loadSession")), [AgentInfo.parse(a) for a in jobjs(meta, "agents")],
-            (jint(meta, "ext") or 0) >= 1, m)
+            (jint(meta, "ext") or 0) >= 1, m, jint(meta, "v") or 0)
 
 
 class SessionState(str, Enum):
@@ -272,6 +273,83 @@ class DiffResult:
 class ImageResult:
     data: str | None  # base64
     error: str | None  # `not_found`, `no_file`, `too_big`, `bad_image`
+    raw: JsonMap = field(default_factory=dict, repr=False)
+    path: str | None = None
+    mime: str | None = None
+
+
+@dataclass
+class CommandArg:
+    value: str
+    desc: str | None = None
+
+
+@dataclass
+class ChatCommand:
+    """A slash command of the chat's agent (`_p2pact/commands`)."""
+    name: str
+    desc: str | None = None
+    hint: str | None = None
+    args: list[CommandArg] = field(default_factory=list)
+
+
+@dataclass
+class HistoryItem:
+    """A closed conversation of an agent on the device (`_p2pact/history`)."""
+    id: str
+    agent: str
+    dir: str
+    title: str
+    updated: int  # ms
+    project: str | None = None
+    count: int | None = None
+    open: bool = False  # it is in `session/list` now
+    raw: JsonMap = field(default_factory=dict, repr=False)
+
+
+@dataclass
+class HistoryPage:
+    items: list[HistoryItem]
+    query: str
+    offset: int  # `from` on the wire
+    total: int
+    cursor: int | None  # the offset of the next page; None on the last
+    partial: bool
+    raw: JsonMap = field(default_factory=dict, repr=False)
+
+
+@dataclass
+class ProjectsResult:
+    dirs: list[str]
+    project_dirs: dict[str, list[str]]
+    dir_repos: dict[str, str]
+    raw: JsonMap = field(default_factory=dict, repr=False)
+
+
+@dataclass
+class AgentOption:
+    """An agent of `_p2pact/agents` with the models it offers for `new_session()`."""
+    id: str
+    name: str
+    type: str
+    enabled: bool
+    models: list[str]
+    default: str | None = None
+    raw: JsonMap = field(default_factory=dict, repr=False)
+
+
+@dataclass
+class AgentsResult:
+    agents: list[AgentOption]
+    presets: list[JsonMap]  # ready-made choices (`id`, `name`, …); the first is the main one
+    raw: JsonMap = field(default_factory=dict, repr=False)
+
+
+@dataclass
+class OpResult:
+    """The answer of a write method (close, restart, hide, history_open)."""
+    ok: bool
+    error: str | None = None
     raw: JsonMap = field(default_factory=dict, repr=False)
 
 

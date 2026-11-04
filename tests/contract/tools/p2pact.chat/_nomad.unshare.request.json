@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"_nomad/unshare","params":{"id":"s1","text":"nobody"}}

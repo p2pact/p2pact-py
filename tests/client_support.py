@@ -46,6 +46,7 @@ class FakeEngine:
         self.decide = lambda wants: wants  # what the person grants a newcomer that asked for `wants`
         self.paired: asyncio.Future = asyncio.get_running_loop().create_future()
         self.overrides: dict = {}  # "1:session/list" -> params -> response, in place of the fixture's
+        self.legacy = False  # answer the chat extensions with `lines` only, as an engine before typed results
         self.watchers: asyncio.Queue = asyncio.Queue()
         self._numbers: dict[int, int] = {}
 
@@ -102,8 +103,12 @@ class FakeEngine:
                 self.notify(1, fixture("p2pact.chat", n + ".notification"))
             return {"jsonrpc": "2.0", "result": {"_meta": {"p2pact": {"older": True}}}}
         stem = method.replace("/", ".")
-        if fixture_exists("p2pact.chat", stem + ".response"):
-            return fixture("p2pact.chat", stem + ".response")
+        name = stem + (".data" if method == "_p2pact/image" and params.get("path", "").endswith("ok.png") else "")
+        if fixture_exists("p2pact.chat", name + ".response"):
+            resp = fixture("p2pact.chat", name + ".response")
+            if self.legacy and stem.startswith("_p2pact."):  # an older engine: only the phone lines, no typed fields
+                resp = {"jsonrpc": "2.0", "result": {"lines": resp["result"].get("lines", [])}}
+            return resp
         return {"jsonrpc": "2.0", "result": {}}
 
     def _fleet(self, method, params):
@@ -171,11 +176,12 @@ class Rig:
         if hasattr(self, "engine"):
             self.engine.close()
 
-    async def connect(self, wants=None, decide=None) -> Computer:
+    async def connect(self, wants=None, decide=None, engine_legacy=False) -> Computer:
         """Starts the engine and the client; pairs with `wants` and waits until the computer's
         hello came and the grants it gave (event 0.6) are known."""
         wants = DEFAULT_WANTS if wants is None else wants
         self.engine = await FakeEngine.start(self.dir())
+        self.engine.legacy = engine_legacy
         if decide:
             self.engine.decide = decide
         self.client = await P2pactClient.open(self.dir(), "Test app", ClientConfig(udp="127.0.0.1:0", tcp=None))

@@ -1,1 +1,1 @@
-{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"_meta":{"p2pact":{"ext":1}}}}
+{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"_meta":{"p2pact":{"ext":1,"v":2}}}}

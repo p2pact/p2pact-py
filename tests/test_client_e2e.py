@@ -29,7 +29,7 @@ class Engine:
         env = dict(os.environ, NOMAD_APP_E2E=str(self.dir), NOMAD_APP_E2E_DECIDE=self.decide)
         with open(self.log, "wb") as log:
             self.proc = await asyncio.create_subprocess_exec(
-                "go", "test", "-count=1", "-v", "-run", "^TestAppE2E$", "./cmd/nomadcode",
+                "go", "test", "-count=1", "-v", "-run", "^TestAppE2E$", "./engine",
                 cwd=self.agent, env=env, stdout=log, stderr=asyncio.subprocess.STDOUT)
 
     def tail(self, n=3000) -> str:
@@ -78,9 +78,17 @@ async def test_app_against_engine(tmp_path):
         assert await engine.wait_file("decision") == "approved"
 
         chat = computer.chat
-        assert (await chat.initialize()).load_session
+        info = await chat.initialize()
+        assert info.load_session and info.v >= 2
         (s,) = (await chat.list_sessions()).sessions
         assert s.id == "s1"
+
+        # typed extension results (complete, not only `lines`)
+        agents = await chat.agents()
+        assert agents.raw.get("agents") is not None and isinstance(agents.agents, list)
+        projects = await chat.projects()
+        assert "dirs" in projects.raw and isinstance(projects.dirs, list)
+        assert isinstance(await chat.files("s1", "x"), list)
 
         # history
         loaded = await chat.load_session("s1")

@@ -1,1 +1,1 @@
-{"jsonrpc":"2.0","result":{"lines":[{"cmd":"image","id":"s1","path":"/w/proj/shot.png","error":"not_found"}]}}
+{"jsonrpc":"2.0","result":{"path":"/w/proj/shot.png","error":"not_found","lines":[{"cmd":"image","id":"s1","path":"/w/proj/shot.png","error":"not_found"}]}}

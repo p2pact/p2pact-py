@@ -205,19 +205,54 @@ async def test_without_handler_the_computer_hears_no_such_method(tmp_path):
         assert fs["error"]["code"] == -32601
 
 
-async def test_extensions(tmp_path):
+@pytest.mark.parametrize("legacy", [False, True], ids=["typed", "legacy"])
+async def test_extensions(tmp_path, legacy):
+    """Every method against its fixture: as is (typed) and with the typed fields stripped (only `lines`)."""
     async with Rig(tmp_path) as rig:
-        chat = (await rig.connect()).chat
-        await chat.close("s1")
+        computer = await rig.connect(engine_legacy=legacy)
+        chat = computer.chat
+        assert (await chat.close("s1")).ok
+        assert_sent(rig.engine, 1, "initialize", "p2pact.chat", "initialize.request")  # ext 1 and v 2
         assert_sent(rig.engine, 1, "_p2pact/close", "p2pact.chat", "_p2pact.close.request")
-        await chat.restart("s1")
-        await chat.hide("s1", True)
-        assert [s.params for s in rig.engine.seen if s.method == "_p2pact/hide"][-1] == {"sessionId": "s1", "on": True}
+        assert (await chat.restart("s1")).ok
+        assert_sent(rig.engine, 1, "_p2pact/restart", "p2pact.chat", "_p2pact.restart.request")
+        assert (await chat.hide("s1", True)).ok
+        assert_sent(rig.engine, 1, "_p2pact/hide", "p2pact.chat", "_p2pact.hide.request")
+        assert (await chat.history_open("h1")).ok
+        assert_sent(rig.engine, 1, "_p2pact/history_open", "p2pact.chat", "_p2pact.history_open.request")
 
         page = await chat.older("s1", 3)
         assert_sent(rig.engine, 1, "_p2pact/older", "p2pact.chat", "_p2pact.older.request")
         (m,) = page.messages
         assert (m.seq, m.role, m.text, page.more) == (1, "user", "привет", False)
+
+        (cmd,) = await chat.commands("s1")
+        assert_sent(rig.engine, 1, "_p2pact/commands", "p2pact.chat", "_p2pact.commands.request")
+        assert (cmd.name, cmd.desc, cmd.hint) == ("review", "Review the changes", "<pr>")
+        assert [(a.value, a.desc) for a in cmd.args] == [("main", "base branch")]
+
+        assert await chat.files("s1", "fac") == ["agent/pkg/acpchat/facade.go"]
+        assert_sent(rig.engine, 1, "_p2pact/files", "p2pact.chat", "_p2pact.files.request")
+
+        h = await chat.history("", 0)
+        assert_sent(rig.engine, 1, "_p2pact/history", "p2pact.chat", "_p2pact.history.request")
+        (item,) = h.items
+        assert (item.id, item.agent, item.dir, item.title, item.updated, item.count) == (
+            "h1", "claude", "/w/proj", "Fix the build", 1793700000000, 12)
+        assert (h.query, h.offset, h.total, h.partial) == ("", 0, 2, False)
+        assert h.cursor == (None if legacy else 1)  # a legacy line has no cursor
+
+        p = await chat.projects("/w/proj")
+        assert_sent(rig.engine, 1, "_p2pact/projects", "p2pact.chat", "_p2pact.projects.request")
+        assert p.dirs == ["/w/proj"] and p.project_dirs == {"proj": ["/w/proj", "/w/proj-api"]}
+        assert p.dir_repos == {"/w/proj": "git@example.com:team/proj.git"}
+
+        ag = await chat.agents()
+        assert_sent(rig.engine, 1, "_p2pact/agents", "p2pact.chat", "_p2pact.agents.request")
+        (a,) = ag.agents
+        assert (a.id, a.name, a.type, a.enabled, a.models, a.default) == (
+            "claude", "Claude Code", "claude", True, ["opus", "sonnet"], "sonnet")
+        assert [(x["id"], x["name"]) for x in ag.presets] == [("p1", "Claude Sonnet")]
 
         diff = await chat.diff("s1")
         assert_sent(rig.engine, 1, "_p2pact/diff", "p2pact.chat", "_p2pact.diff.request")
@@ -227,6 +262,29 @@ async def test_extensions(tmp_path):
         image = await chat.image("s1", "/w/proj/shot.png")
         assert_sent(rig.engine, 1, "_p2pact/image", "p2pact.chat", "_p2pact.image.request")
         assert image.error == "not_found" and image.data is None
+        assert image.path == "/w/proj/shot.png"
+        ok = await chat.image("s1", "/w/proj/ok.png")
+        assert ok.error is None and ok.data and ok.data.startswith("iVBOR")
+        assert ok.mime == (None if legacy else "image/png")
+
+
+async def test_initialize_reports_engine_level(tmp_path):
+    async with Rig(tmp_path) as rig:
+        chat = (await rig.connect()).chat
+        assert (await chat.initialize()).v == 2
+
+
+async def test_failed_write_method(tmp_path):
+    async with Rig(tmp_path) as rig:
+        chat = (await rig.connect()).chat
+        rig.engine.overrides["1:_p2pact/restart"] = lambda p: {
+            "jsonrpc": "2.0", "result": {"ok": False, "error": "not ours", "lines": []}}
+        r = await chat.restart("s1")
+        assert not r.ok and r.error == "not ours"
+        rig.engine.overrides["1:_p2pact/restart"] = lambda p: {
+            "jsonrpc": "2.0", "result": {"lines": [{"cmd": "alert", "id": "s1", "text": "boom"}]}}
+        r = await chat.restart("s1")
+        assert not r.ok and r.error == "boom"
 
 
 async def test_late_reports(tmp_path):

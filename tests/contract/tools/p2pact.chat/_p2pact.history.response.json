@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","result":{"items":[{"id":"h1","agent":"claude","dir":"/w/proj","title":"Fix the build","updated":1793700000000,"count":12}],"query":"","from":0,"total":2,"cursor":1,"lines":[{"cmd":"history","query":"","from":0,"total":2,"list":[{"id":"h1","agent":"claude","dir":"/w/proj","title":"Fix the build","updated":1793700000000,"count":12}]}]}}

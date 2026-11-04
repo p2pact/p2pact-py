@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","result":{"dirs":["/w/proj"],"project_dirs":{"proj":["/w/proj","/w/proj-api"]},"dir_repos":{"/w/proj":"git@example.com:team/proj.git"},"lines":[{"cmd":"projects","dirs":["/w/proj"],"project_dirs":{"proj":["/w/proj","/w/proj-api"]},"dir_repos":{"/w/proj":"git@example.com:team/proj.git"}}]}}

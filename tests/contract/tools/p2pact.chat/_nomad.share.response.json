@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","result":{"lines":[{"cmd":"shares","id":"s1","url":"https://127.0.0.1/g#chan.key","list":[{"id":"chan","session":"s1","created":1730000000000,"until":0,"joined":0,"online":false}]}]}}

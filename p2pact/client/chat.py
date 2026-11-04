@@ -7,11 +7,12 @@ import uuid
 from typing import TYPE_CHECKING, Awaitable, Callable, Union
 
 from .errors import RpcError
-from .models import (AgentInfo, ChatMessage, ChatSession, ChatUpdate, ContentBlock, DiffFile, DiffResult, ImageResult,
+from .models import (AgentInfo, AgentOption, AgentsResult, ChatCommand, CommandArg, HistoryItem, HistoryPage, OpResult,
+                     ProjectsResult, ChatMessage, ChatSession, ChatUpdate, ContentBlock, DiffFile, DiffResult, ImageResult,
                      InitializeResult, LoadedSession, NewSession, OlderPage, PermissionOption, PermissionOutcome,
                      PermissionRequest, PromptResult, Question, QuestionOption, QuestionRequest, RequestAnswered,
                      SessionList, SessionState, ToolCallInfo)
-from .util import Events, JsonMap, jbool, jint, jobj, jobjs, jstr, normalize, p2pact_meta, stream_of, wire
+from .util import Events, JsonMap, jbool, jint, jobj, jobjs, jstr, jstrs, normalize, p2pact_meta, stream_of, wire
 
 if TYPE_CHECKING:
     from .client import Computer
@@ -69,7 +70,7 @@ class ChatClient:
         return await asyncio.shield(f)
 
     async def _initialize(self) -> InitializeResult:
-        params = {"protocolVersion": 1, "clientCapabilities": {}, "_meta": {"p2pact": {"ext": 1}}}
+        params = {"protocolVersion": 1, "clientCapabilities": {}, "_meta": {"p2pact": {"ext": 1, "v": 2}}}
         self.info = InitializeResult.parse(await self._c.rpc(CHAT_TOOL, "initialize", params))
         return self.info
 
@@ -187,39 +188,106 @@ class ChatClient:
         r = await self._settled("_p2pact/" + name, params, stream_of(jstr(params, "sessionId")))
         return jobjs(r, "lines")
 
-    async def close(self, session_id: str) -> list[JsonMap]:
+    async def _ext(self, name: str, params: JsonMap) -> tuple[JsonMap, list[JsonMap]]:
+        """`_p2pact/<name>`: the typed result and its `lines`. An engine older than `v: 2` may answer before
+        late content (commands, agents, history) is ready; that content then comes only as `reports`
+        and these methods return it empty (a caller that needs it listens to `reports`)."""
+        r = await self._settled("_p2pact/" + name, params, stream_of(jstr(params, "sessionId")))
+        return r, jobjs(r, "lines")
+
+    @staticmethod
+    def _line(lines: list[JsonMap], cmd: str) -> JsonMap:
+        return next((x for x in lines if x.get("cmd") == cmd), {})
+
+    @staticmethod
+    def _op(r: JsonMap, lines: list[JsonMap]) -> OpResult:
+        if "ok" in r:  # typed; an older engine has only lines: a failure is the `alert` line
+            return OpResult(bool(jbool(r, "ok")), jstr(r, "error"), r)
+        alert = next((x for x in lines if x.get("cmd") == "alert"), None)
+        return OpResult(alert is None, jstr(alert, "text") if alert else None, r)
+
+    async def close(self, session_id: str) -> OpResult:
         """Closes the chat: it leaves the list."""
-        return await self.command("close", {"sessionId": session_id})
+        return self._op(*await self._ext("close", {"sessionId": session_id}))
 
-    async def restart(self, session_id: str) -> list[JsonMap]:
+    async def restart(self, session_id: str) -> OpResult:
         """Starts the agent of a chat again."""
-        return await self.command("restart", {"sessionId": session_id})
+        return self._op(*await self._ext("restart", {"sessionId": session_id}))
 
-    async def hide(self, session_id: str, on: bool = True) -> list[JsonMap]:
+    async def hide(self, session_id: str, on: bool = True) -> OpResult:
         """Hides a chat from the list (on) or shows it again."""
-        return await self.command("hide", {"sessionId": session_id, "on": on})
+        return self._op(*await self._ext("hide", {"sessionId": session_id, "on": on}))
+
+    async def history_open(self, session_id: str) -> OpResult:
+        """`_p2pact/history_open`: brings a closed conversation (the `id` of a HistoryItem) back into the list."""
+        return self._op(*await self._ext("history_open", {"sessionId": session_id}))
 
     async def older(self, session_id: str, before: int) -> OlderPage:
         """`_p2pact/older`: the page of messages just before `before` (the `seq` of the oldest you have)."""
-        lines = await self.command("older", {"sessionId": session_id, "before": before})
-        line = next((x for x in lines if x.get("cmd") == "older"), {})
+        r, lines = await self._ext("older", {"sessionId": session_id, "before": before})
+        src = r if "messages" in r else self._line(lines, "older")
         msgs = [ChatMessage(jint(m, "seq") or 0, jstr(m, "role") or "", jstr(m, "text") or "", jstr(m, "time"),
-                            [i for i in (m.get("images") or []) if isinstance(i, str)], m) for m in jobjs(line, "messages")]
-        return OlderPage(session_id, msgs, bool(jbool(line, "more")), line)
+                            [i for i in (m.get("images") or []) if isinstance(i, str)], m) for m in jobjs(src, "messages")]
+        return OlderPage(session_id, msgs, bool(jbool(src, "more")), src)
+
+    async def commands(self, session_id: str) -> list[ChatCommand]:
+        """`_p2pact/commands`: the agent's slash commands of the chat (the engine asks the agent: seconds)."""
+        r, lines = await self._ext("commands", {"sessionId": session_id})
+        items = jobjs(r, "commands") if "commands" in r else jobjs(self._line(lines, "commands"), "list")
+        return [ChatCommand(jstr(c, "name") or "", jstr(c, "desc"), jstr(c, "hint"),
+                            [CommandArg(jstr(a, "value") or "", jstr(a, "desc")) for a in jobjs(c, "args")]) for c in items]
+
+    async def files(self, session_id: str, query: str) -> list[str]:
+        """`_p2pact/files`: files of the chat's folder matching `query` (up to 50), for `@file` completion."""
+        r, lines = await self._ext("files", {"sessionId": session_id, "query": query})
+        return jstrs(r, "files") if "files" in r else jstrs(self._line(lines, "files"), "list")
+
+    async def history(self, query: str = "", offset: int = 0) -> HistoryPage:
+        """`_p2pact/history`: closed conversations of the device's agents, newest first; `HistoryPage.cursor`
+        is the `offset` of the next page."""
+        r, lines = await self._ext("history", {"query": query, "offset": offset})
+        typed = "items" in r
+        src = r if typed else self._line(lines, "history")
+        items = [HistoryItem(jstr(i, "id") or "", jstr(i, "agent") or "", jstr(i, "dir") or "", jstr(i, "title") or "",
+                             jint(i, "updated") or 0, jstr(i, "project"), jint(i, "count"), bool(jbool(i, "open")), i)
+                 for i in jobjs(src, "items" if typed else "list")]
+        return HistoryPage(items, jstr(src, "query") or "", jint(src, "from") or 0, jint(src, "total") or len(items),
+                           jint(src, "cursor"), bool(jbool(src, "partial")), src)
+
+    async def projects(self, cwd: str | None = None) -> ProjectsResult:
+        """`_p2pact/projects`: recent folders and folders by project, to start a chat in (`cwd`: one more to describe)."""
+        r, lines = await self._ext("projects", {"cwd": cwd} if cwd is not None else {})
+        src = r if "dirs" in r else self._line(lines, "projects")
+        pd = jobj(src, "project_dirs") or {}
+        repos = jobj(src, "dir_repos") or {}
+        return ProjectsResult(jstrs(src, "dirs"),
+                              {k: [x for x in v if isinstance(x, str)] for k, v in pd.items() if isinstance(v, list)},
+                              {k: v for k, v in repos.items() if isinstance(v, str)}, src)
+
+    async def agents(self) -> AgentsResult:
+        """`_p2pact/agents`: the agents with the models they offer for `new_session()`, and the presets."""
+        r, lines = await self._ext("agents", {})
+        if "agents" in r:
+            agents, presets = jobjs(r, "agents"), jobjs(r, "presets")
+        else:
+            agents, presets = jobjs(self._line(lines, "agents"), "list"), jobjs(self._line(lines, "presets"), "list")
+        return AgentsResult([AgentOption(jstr(a, "id") or "", jstr(a, "name") or "", jstr(a, "type") or "",
+                                         bool(jbool(a, "enabled")), jstrs(a, "models"), jstr(a, "default"), a)
+                             for a in agents], presets, r)
 
     async def diff(self, session_id: str) -> DiffResult:
         """`_p2pact/diff`: the changes in the chat's folder (git)."""
-        lines = await self.command("diff", {"sessionId": session_id})
-        line = next((x for x in lines if x.get("cmd") == "diff"), {})
+        r, lines = await self._ext("diff", {"sessionId": session_id})
+        line = r if ("files" in r or "error" in r) else self._line(lines, "diff")
         files = [DiffFile(jstr(f, "path") or "", jint(f, "added") or 0, jint(f, "removed") or 0, jstr(f, "status"))
                  for f in jobjs(line, "files")]
         return DiffResult(files, jstr(line, "patch") or "", bool(jbool(line, "truncated")), jstr(line, "error"), line)
 
     async def image(self, session_id: str, path: str) -> ImageResult:
         """`_p2pact/image`: the bytes (base64) of an image a message points to."""
-        lines = await self.command("image", {"sessionId": session_id, "path": path})
-        line = next((x for x in lines if x.get("cmd") == "image"), {})
-        return ImageResult(jstr(line, "data"), jstr(line, "error"), line)
+        r, lines = await self._ext("image", {"sessionId": session_id, "path": path})
+        line = r if ("data" in r or "error" in r) else self._line(lines, "image")
+        return ImageResult(jstr(line, "data"), jstr(line, "error"), line, jstr(line, "path"), jstr(line, "mime"))
 
     # --- from the computer ---
 

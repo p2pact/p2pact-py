@@ -1,1 +1,1 @@
-{"jsonrpc":"2.0","result":{"lines":[{"cmd":"diff","id":"s1","files":[{"path":"a.go","added":3,"removed":1,"status":"M"}],"patch":"diff --git a/a.go b/a.go\n","truncated":false}]}}
+{"jsonrpc":"2.0","result":{"files":[{"path":"a.go","added":3,"removed":1,"status":"M"}],"patch":"diff --git a/a.go b/a.go\n","truncated":false,"lines":[{"cmd":"diff","id":"s1","files":[{"path":"a.go","added":3,"removed":1,"status":"M"}],"patch":"diff --git a/a.go b/a.go\n","truncated":false}]}}

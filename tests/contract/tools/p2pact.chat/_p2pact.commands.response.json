@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","result":{"commands":[{"name":"review","desc":"Review the changes","hint":"<pr>","args":[{"value":"main","desc":"base branch"}]}],"lines":[{"cmd":"commands","id":"s1","list":[{"name":"review","desc":"Review the changes","hint":"<pr>","args":[{"value":"main","desc":"base branch"}]}]}]}}
