@@ -76,6 +76,9 @@ class Peer:
     # joined with wants: [] until the first 0.6
     granted: list[Grant] | None = None
     local: bool = False  # we reach the device over our local socket (a plugin's host, spec §3)
+    # forward: the devices we forward to for this one (spec §3, Node.allow_forward); the consent
+    # is for the pair, so each of the two lists the other
+    forward: list[str] = field(default_factory=list)
 
     def allowed(self) -> list[Grant]:
         """What we let the device use of ours; the default if never set."""
@@ -129,6 +132,7 @@ class Trust:
                          j.get("hints") or {}, j.get("added", 0), _unb64(j["sign_key"]) if j.get("sign_key") else None,
                          j.get("os"), j.get("via"), int(j.get("kind") or 0), _grants_from_json(j.get("grants")),
                          _grants_from_json(j.get("granted")), bool(j.get("local")))
+                p.forward = [a for a in (j.get("forward") or []) if isinstance(a, str)]
                 if len(p.key) == 32 and address(p.key) == p.addr:
                     self.peers[p.addr] = p
         except (OSError, ValueError, KeyError):
@@ -184,8 +188,16 @@ class Trust:
     def remove(self, addr: str) -> bool:
         if self.peers.pop(addr, None) is None:
             return False
+        for p in self.peers.values():  # forgetting a device withdraws forwarding to it
+            p.forward = [a for a in p.forward if a != addr]
         self._save()
         return True
+
+    def set_forward(self, addr: str, lst: list[str]):
+        """Stores the devices we forward to for a known device."""
+        if p := self.peers.get(addr):
+            p.forward = list(lst)
+            self._save()
 
     def _save(self):
         out = []
@@ -205,6 +217,8 @@ class Trust:
                 j["granted"] = _grants_to_json(p.granted)
             if p.local:
                 j["local"] = True
+            if p.forward:
+                j["forward"] = p.forward
             out.append(j)
         os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
         tmp = self.path + ".tmp"  # replaced in one step: never read half-written

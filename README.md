@@ -69,6 +69,13 @@ conversation only, in the background (`no_learning = True` turns that off).
   `node.plugin_env(ttl, grants)` gives the environment (`P2PACT_SOCKET`, `P2PACT_INVITE`) to start a
   program with; the program calls `node, host = await new_plugin(data_dir, name)` (from
   `p2pact.plugin`). See `examples/plugin_hello`.
+- `node.allow_forward(a, b, on)` — opt this device in as a forwarder between two devices it trusts
+  (spec §3, via a third device): they reach each other through it when nothing else works, end to
+  end encrypted. Kept with the trusted list; `node.forward_rate` limits each direction (256 KB/s by
+  default). The two devices need nothing: they learn it from the hello and use the road
+  `via:<forwarder>` (`paths`) with the same rank as an application road. `forwards`, `forwarders`
+  and `forward_stats` tell who forwards for whom and how much; `set_advertise({})` announces no
+  addresses.
 
 ## Client SDK (`p2pact.client`)
 
@@ -99,7 +106,8 @@ the computer allowed. See `examples/client_cli`.
 ## Status
 
 Pairing, sessions, UDP and TCP roads, delivery with congestion control, messages,
-compression with the common dictionary and per-device dictionaries of its own. Not yet: the relay road, the family tool, Bluetooth.
+compression with the common dictionary and per-device dictionaries of its own, forwarding via a
+third device. Not yet: the relay road, the family tool, Bluetooth.
 
 ## Develop
 

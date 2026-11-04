@@ -1,6 +1,6 @@
 """Interop peer for p2pact-tests: a node driven by JSON lines on stdin (see p2pact-go's
 cmd/p2pact-interop for the commands, including kinds, named tools, grants, wants, the local
-socket and hosted tools). Run: python -m p2pact.interop [data dir] [name]"""
+socket, hosted tools and forwarding via a third device: hide, forward, paths, forward-stats). Run: python -m p2pact.interop [data dir] [name]"""
 import asyncio
 import base64
 import json
@@ -169,6 +169,17 @@ async def main():
                     return [decode(r) for r in res]
                 node.handle_tool_all(name, forward)
                 say({"ok": True})
+            elif cmd == "hide":  # announce no addresses: reachable over known roads or a forwarder only
+                node.set_advertise({})
+                say({"ok": True})
+            elif cmd == "forward":
+                node.allow_forward(req.get("a", ""), req.get("b", ""), bool(req.get("on")))
+                say({"ok": True})
+            elif cmd == "paths":
+                say({"paths": node.paths(req.get("peer", ""))})
+            elif cmd == "forward-stats":
+                fw, dr = node.forward_stats()
+                say({"forwarded": fw, "dropped": dr})
             elif cmd == "close":
                 break
             else:

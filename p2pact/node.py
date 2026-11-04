@@ -14,6 +14,7 @@ from . import learn
 from .compress import ZIP_MIN, Dict, DictStore, compress, decompress, dict_id
 from .crypto import address, random_bytes
 from .delivery import DATA_HEADER, MSG_MAX, Stream, keepalive
+from .forward import EV_FORWARD, EV_FORWARDED, Forwarding, forward_msg, is_via
 from .learn import History, history_path
 from .noise import Handshake
 from .plugin import ENV_INVITE, ENV_SOCKET
@@ -27,6 +28,9 @@ P_INIT, P_RESP, P_PAIR1, P_PAIR2, P_PAIR3, P_DATA, P_RESET = 1, 2, 3, 4, 5, 6, 7
 TS_SKEW_NS = 120 * 10**9
 INIT_EVERY, AUTO_CONNECT, ALIVE_FOR, KEEPALIVE_GAP, SESSION_IDLE = 1.0, 30.0, 60.0, 25.0, 180.0
 HOLD_ASK, HOLD_DROP = 15.0, 120.0  # held messages: ask again, then drop them (_unhold)
+# how often the direct roads are tried while a session runs via a third device (spec §7); tests
+# shorten it
+PROBE_EVERY = 30.0
 
 ERR_NO_METHOD, ERR_BAD_ARGS, ERR_NOT_FOUND, ERR_FORBIDDEN, ERR_FAILED, ERR_NOT_DELIVERED = 1, 2, 3, 4, 5, 6
 
@@ -125,9 +129,11 @@ class _PeerState:
         self.last_talk = 0.0
         self.inbox: dict[int, list] = {}  # calls and events waiting for their turn, per stream
         self.named: dict[str, tuple[int, int]] = {}  # its named tools {name: (number, version)}, from its hello (spec §8)
+        self.forwards: list[str] = []  # the devices it forwards to for us, from its hello (forward.py)
+        self.last_probe = 0.0  # when its direct roads were last tried (_probe)
 
 
-class Node:
+class Node(Forwarding):
     def __init__(self, dir_: str, name: str):
         self.name = name
         self.dir = dir_
@@ -184,6 +190,8 @@ class Node:
         self.tasks: list[asyncio.Task] = []
         self.woken = False
         self.handshakes = 0
+        self.advertise: dict | None = None  # addresses announced instead of ours (set_advertise)
+        self._forward_init()
         self.handle(0, 1, lambda peer, args: [])
         self.handle(0, 2, lambda peer, args: self._info(peer))
         self.handle(0, 5, self._dict_handler)
@@ -554,7 +562,11 @@ class Node:
         s = self.current.pop(addr, None)
         if s:
             self.sessions.pop(s.local, None)
+        p = self.trust.get(addr)
+        fw = list(p.forward) if p else []  # the devices we forwarded to it for: they learn it is withdrawn
         self.trust.remove(addr)
+        for a in fw:
+            self._hello(a)
 
     # --- calls and events ---
 
@@ -608,10 +620,21 @@ class Node:
         """The hello (spec §6, 0.2); the dictionaries are those peer may see, by slot."""
         # tools whose handlers check the caller's level are tools too
         tools = {t: 1 for (t, _m) in (*self.handlers, *self.level_handlers) if t != 0 and t not in self.numbers}
-        return [self.name, _goos(), "p2pact-py", tools, self.dicts.ids(peer), hints_to_wire(self._hints()), self.kind,
+        info = [self.name, _goos(), "p2pact-py", tools, self.dicts.ids(peer), hints_to_wire(self._hints()), self.kind,
                 self._named()]
+        if fw := self._forwards_wire(peer):  # whom we forward to for it (spec §3)
+            info.append(fw)
+        return info
+
+    def set_advertise(self, hints: dict | None):
+        """Announces these addresses ({"udp": [...], "tcp": [...]}) instead of our own in invites
+        and hellos; {} — none, so known devices reach us only over roads they already have, or
+        through a forwarder; None — our own again."""
+        self.advertise = None if hints is None else dict(hints)
 
     def _hints(self) -> dict:
+        if self.advertise is not None:
+            return dict(self.advertise)
         h = {}
         if self.udp and (u := self.udp.local_addrs()):
             h["udp"] = u
@@ -957,10 +980,17 @@ class Node:
                         if isinstance(nm, str) and isinstance(v, list) and len(v) >= 2 and _is_int(v[0]) and _is_int(v[1]):
                             ps.named[nm] = (v[0], v[1])
                 ps.dicts, ps.lacks, ps.tried = _ids(decode(a[7])), [], []
+                self._heard_forwards(peer, ps, decode(a[11]) if len(a) >= 12 else None)
                 self._fetch_new(peer, ps)
                 self._drain(peer, ps)
                 if self.on_hello:
                     asyncio.get_running_loop().call_soon(self.on_hello, peer)
+                return
+            if tool == 0 and ev == EV_FORWARD:  # carry a packet to another device (spec §3)
+                self._forward(peer, a[3:])
+                return
+            if tool == 0 and ev == EV_FORWARDED:  # a packet another device sent us through this one
+                self._forwarded(peer, a[3:])
                 return
             if tool == 0 and ev == 6 and len(a) >= 4:  # what we may use of its tools
                 if (g := parse_grants(decode(a[3]))) is not None:
@@ -1035,14 +1065,23 @@ class Node:
             if mine:
                 alive = mine
         if alive and not all_:
-            rank = lambda e: {"udp": 0, "tcp": 1, "local": 1}.get(e["ep"][0].name, 2)
+            rank = lambda e: _rank(e["ep"][0])
             # the road heard from last; a better kind only if heard within half a second of it
             best = max(alive, key=lambda e: e["last_recv"])
             for e in alive:
                 if rank(e) < rank(best) and best["last_recv"] - e["last_recv"] < 0.5:
                     best = e
             return [best]
-        out = alive
+        # a road via a third device takes retransmissions only while no other road is live:
+        # every packet on it costs the forwarder (spec §7)
+        other = any(not is_via(e["ep"][0]) for e in alive)
+        out = self._hinted(peer, ps, list(alive))
+        if other:
+            out = [e for e in out if not is_via(e["ep"][0])]
+        return out
+
+    def _hinted(self, peer, ps, out: list[dict]) -> list[dict]:
+        """out with the roads we know of for the device but have not heard on lately."""
         p = self.trust.get(peer)
         if not p:
             return out
@@ -1059,7 +1098,37 @@ class Node:
             if road:
                 for a in addrs or []:
                     add(road, a)
+        for x, xs in self.peers.items():  # devices that forward to it for us (spec §3)
+            if x != peer and x in self.current and peer in xs.forwards:
+                add(self._via(x), peer)
         return out
+
+    def _direct(self, ps, now) -> bool:
+        """We are in session with the device and have a live road to it that is not via a third
+        device. Forwarding takes one hop only — no chains, no loops."""
+        if ps.addr not in self.current:
+            return False
+        return any(not is_via(e["ep"][0]) and now - e["last_recv"] <= ALIVE_FOR for e in ps.eps.values())
+
+    def _probe(self, now, peer, ps, s):
+        """Tries the direct roads to a device while the session runs via a third device (spec
+        §7): a keepalive to every UDP and TCP address known for it, every PROBE_EVERY. The one
+        that answers is live, and being better it takes over."""
+        if now - ps.last_probe < PROBE_EVERY:
+            return
+        c = self._candidates(peer, ps, now, False)
+        if len(c) != 1 or _rank(c[0]["ep"][0]) < 2:
+            return
+        ps.last_probe = now
+        for e in self._candidates(peer, ps, now, True):
+            if _rank(e["ep"][0]) < 2:
+                self._seal_to(s, e, now, keepalive())
+
+    def _seal_to(self, s, e, now, plain: bytes):
+        hdr = bytes((P_DATA,)) + _be32(s.remote) + _be32(s.send_n)
+        e["ep"][0].send(e["ep"][1], hdr + s.send.encrypt_at(s.send_n, hdr, plain))
+        s.send_n += 1
+        e["last_send"] = now
 
     def _send_data(self, now, peer, ps, s, plain, all_):
         hdr = bytes((P_DATA,)) + _be32(s.remote) + _be32(s.send_n)
@@ -1099,6 +1168,7 @@ class Node:
 
     def _pump(self):
         now = time.time()
+        self._fwd_release(time.monotonic())
         for peer, ps in list(self.peers.items()):
             s = self.current.get(peer)
             if not s:
@@ -1111,7 +1181,8 @@ class Node:
                 continue
             c = self._candidates(peer, ps, now, False)
             if len(c) == 1:
-                ps.st.reliable = c[0]["ep"][0].name != "udp"
+                # a road via a third device may drop (the forwarder's limits): a window applies, as on UDP
+                ps.st.reliable = c[0]["ep"][0].name != "udp" and not is_via(c[0]["ep"][0])
             for i in range(257):
                 if i == 256:
                     self._wake()
@@ -1120,12 +1191,9 @@ class Node:
                 if not nxt:
                     break
                 self._send_data(now, peer, ps, s, nxt[0], nxt[1])
-            for e in ps.eps.values():
+            for e in list(ps.eps.values()):
                 if now - e["last_recv"] <= ALIVE_FOR and now - e["last_send"] >= KEEPALIVE_GAP:
-                    hdr = bytes((P_DATA,)) + _be32(s.remote) + _be32(s.send_n)
-                    e["ep"][0].send(e["ep"][1], hdr + s.send.encrypt_at(s.send_n, hdr, keepalive()))
-                    s.send_n += 1
-                    e["last_send"] = now
+                    self._seal_to(s, e, now, keepalive())
 
     def _maintain(self):
         now = time.time()
@@ -1133,6 +1201,8 @@ class Node:
             ps = self._peer(p.addr)
             if ps and p.addr not in self.current and now - ps.last_init >= AUTO_CONNECT:
                 self._start_init(now, p.addr, ps, None)
+            elif ps and (s := self.current.get(p.addr)):
+                self._probe(now, p.addr, ps, s)
         self._unhold(now)
         self._reannounce(now)
         for idx, s in list(self.sessions.items()):
@@ -1545,4 +1615,11 @@ def _bootstrap(m: bytes) -> bool:
 def _out_of_order(m: bytes) -> bool:
     if len(m) < 2:
         return False
-    return m[1] in (1, 2) or (len(m) > 3 and m[1] == 3 and m[2] == 0 and m[3] in (2, 5))
+    return m[1] in (1, 2) or (len(m) > 3 and m[1] == 3 and m[2] == 0 and m[3] in (2, 5)) or forward_msg(m)
+
+
+def _rank(road) -> int:
+    """How good a road is (spec §7), lower is better."""
+    if is_via(road):
+        return 3  # with an application road: it carries the session while nothing better is up
+    return {"udp": 0, "tcp": 1, "local": 1}.get(road.name, 2)
