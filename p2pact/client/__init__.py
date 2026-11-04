@@ -8,7 +8,7 @@ computer by its invite, then use `computer.chat`, `computer.fleet`, `computer.pl
         chats = await computer.chat.list_sessions()
 """
 from .chat import ChatClient, PermissionHandler, QuestionHandler, new_mid
-from .client import (CHAT, DEFAULT_WANTS, FLEET, PLUGINS, ClientConfig, Computer, ComputerEvent, ConnectionState,
+from .client import (CHAT, DEFAULT_WANTS, FLEET, PLUGINS, TERM, ClientConfig, Computer, ComputerEvent, ConnectionState,
                      Forgotten, GrantsChanged, Online, P2pactClient, Paired, ToolEvent)
 from .errors import (BadArgsError, CallError, FailedError, ForbiddenError, NoMethodError, NotDeliveredError,
                      NotFoundError, RpcError)

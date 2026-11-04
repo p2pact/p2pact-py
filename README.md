@@ -60,6 +60,15 @@ conversation only, in the background (`no_learning = True` turns that off).
   method, ...)` calls a device's tool by name (`tool_number`, `peer_tool_name`, `peer_tools`).
   `handle_tool_all(name, h)` serves every method of a tool with one `h(peer, level, method, args)`
   (a device hosting another program's tool); `unregister_tool(name)` takes it back.
+- Terminal, tool 5 `p2pact.term` (`term.md`): the SDK has no terminals of its own; an application
+  serves it with `handle_tool_all("p2pact.term", h)` (announced under the fixed number 5 in the
+  hello's `{tool: version}`; `unregister_tool` takes it back) and a caller uses
+  `call_tool(peer, "p2pact.term", method, ...)` or `Computer.call_tool` (`p2pact.client.TERM`).
+  Former names (spec §8.1): a device that served the terminal before under a name of its own
+  declares `node.alias_tool(former, "p2pact.term")` and registers the same handlers under both;
+  grants on either name count for both (the highest level, `node.level_in`), a call is answered
+  under the number it came by, and a caller goes to 5 when the device announces it in its hello,
+  else to the former name (`resolve_tool`, `peer_has_tool`; `tool_number` follows).
 - Grants (spec §8.1): `set_grants(peer, [Grant("com.example.jira", LEVEL_READ)])`, `grant`,
   `revoke_grants`, `mark_read(tool, *methods)`, `handle_level(tool, method, h)`; a call outside the
   grants is error 4. A newcomer may ask with `join(invite, wants=[…])`; the inviting application

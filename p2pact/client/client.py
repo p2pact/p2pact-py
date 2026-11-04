@@ -8,7 +8,7 @@ from enum import Enum
 from typing import Any
 
 from ..cbor import decode
-from ..grants import LEVEL_READ, LEVEL_WRITE, Grant, grant_level
+from ..grants import LEVEL_READ, LEVEL_WRITE, Grant
 from ..node import ERR_FORBIDDEN, ERR_NO_METHOD, KIND_CLIENT, KIND_PLUGIN, Node, P2PACTError, later
 from ..store import Invite, Peer
 from .chat import CHAT_TOOL, ChatClient
@@ -20,6 +20,9 @@ from .util import Events, JsonMap, jobj, jstr, normalize, wire
 CHAT = "p2pact.chat"
 FLEET = "p2pact.fleet"
 PLUGINS = "p2pact.plugins"
+# The terminal (tool 5, spec term.md): the SDK has no typed client for it, call it with Computer.call_tool.
+# A computer that knows it by a former name answers once the alias is declared: node.alias_tool(former, TERM).
+TERM = "p2pact.term"
 
 # What the SDK itself uses, to ask for when pairing: chat and fleet in full, the plugins' view.
 # The person of the computer may narrow it (Computer.grants tells what was granted).
@@ -286,7 +289,7 @@ class Computer:
 
     def level(self, tool: str) -> int:
         """The level we have on a tool of the computer: 0 none, 1 LEVEL_READ, 2 LEVEL_WRITE."""
-        return grant_level(self.grants, tool)
+        return self._node.level_in(self.grants, tool)
 
     def can_read(self, tool: str) -> bool:
         return self.level(tool) >= LEVEL_READ
@@ -344,7 +347,8 @@ class Computer:
         core spec §8.2). It waits for the computer's hello if it has not come. Arguments are JSON
         trees (numbers, text, lists, maps, bytes); the result values are decoded the same way."""
         t = self.owner.config.call_timeout if timeout is None else timeout
-        if self.tool_number(name) is None and not self._hello:
+        # a tool with a former name is resolved by the hello: which of its names the computer announces
+        if (self.tool_number(name) is None or len(self._node._tool_names(name)) > 1) and not self._hello:
             # the hello may still be on its way after pairing
             try:
                 await asyncio.wait_for(self._ready.wait(), t or 10)

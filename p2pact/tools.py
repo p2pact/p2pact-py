@@ -9,7 +9,14 @@ FIXED_TOOLS = {
     "p2pact.fleet": 2,
     "p2pact.family": 3,
     "p2pact.plugins": 4,
+    "p2pact.term": 5,
 }
+
+
+def fixed_tool(name: str) -> int | None:
+    """The number the spec gives a tool name (§8): 0–63, the same on every device. None — the
+    name is not one of the spec's."""
+    return FIXED_TOOLS.get(name)
 
 # The first number a device may choose for a named tool (spec §8).
 FIRST_NAMED_TOOL = 64

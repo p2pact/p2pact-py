@@ -129,6 +129,7 @@ class _PeerState:
         self.last_talk = 0.0
         self.inbox: dict[int, list] = {}  # calls and events waiting for their turn, per stream
         self.named: dict[str, tuple[int, int]] = {}  # its named tools {name: (number, version)}, from its hello (spec §8)
+        self.fixed: dict[int, int] | None = None  # its tools of the spec {tool: version}, from its hello; None — no hello yet
         self.forwards: list[str] = []  # the devices it forwards to for us, from its hello (forward.py)
         self.last_probe = 0.0  # when its direct roads were last tried (_probe)
 
@@ -186,6 +187,8 @@ class Node(Forwarding):
         self.names: dict[str, int] = {}
         self.numbers: dict[int, str] = {}
         self.versions: dict[int, int] = {}
+        # alias_tool(): a former name → the tool's name now; grants on either count for both (spec §8.1)
+        self.aliases: dict[str, str] = {}
         self.reset_at: dict[str, float] = {}
         self.tasks: list[asyncio.Task] = []
         self.woken = False
@@ -303,9 +306,36 @@ class Node(Forwarding):
         return p.offered() if p else []
 
     def level(self, peer: str, tool: str) -> int:
-        """The level a device has on one of our tools, by name."""
+        """The level a device has on one of our tools, by name (counting its aliases, alias_tool())."""
         p = self.trust.get(peer)
-        return grant_level(p.grants, tool) if p else 0
+        return self.level_in(p.grants, tool) if p else 0
+
+    def level_in(self, grants: list[Grant] | None, tool: str) -> int:
+        """The level a list of grants gives on a tool, counting its aliases: grant_level() for a
+        tool known by more than one name (spec §8.1, Former names): the highest on any of them."""
+        return max(grant_level(grants, nm) for nm in self._tool_names(tool))
+
+    def _tool_names(self, name: str) -> list[str]:
+        """A tool name with its aliases: the tool's name now first, then its former ones."""
+        name = self.aliases.get(name, name)
+        return [name, *(a for a, c in self.aliases.items() if c == name)]
+
+    def alias_tool(self, alias: str, canonical: str):
+        """Declares alias a former name of the tool canonical (spec §8.1, Former names): a device
+        may serve one tool under both names, the spec's (say "p2pact.term", tool 5) and the one it
+        had before (say "dev.nomadcode.term", a named tool from 64 up). Grants on either name count
+        for both: a call or an event of either gets the highest level granted on any of them
+        (level_in()). Also what call_tool() by canonical falls back to on a device that announces
+        only the alias. Serve the alias as any named tool (handle_tool_all, handle_tool — the same
+        handlers as canonical's) and answer and send events under the number it was called by."""
+        if not valid_tool_name(alias):
+            raise ValueError("bad alias: " + alias)
+        if canonical not in FIXED_TOOLS and not valid_tool_name(canonical):
+            raise ValueError("bad tool name: " + canonical)
+        canonical = self.aliases.get(canonical, canonical)  # an alias of an alias names the same tool
+        if alias == canonical:
+            raise ValueError("a tool is not its own alias: " + alias)
+        self.aliases[alias] = canonical
 
     def set_grants(self, peer: str, grants):
         """Replaces what a trusted device may use (an empty list revokes everything), keeps it
@@ -385,12 +415,23 @@ class Node(Forwarding):
         """Serves every method of the named tool with h(peer, level, method, raw_args) (the tool
         is registered at version 1 if it is not yet). The node only requires read on the tool;
         what each method needs is for h to check. Methods registered one by one with handle()
-        keep their own handlers. For a device that hosts another program's tool (spec §8.2)."""
+        keep their own handlers. For a device that hosts another program's tool (spec §8.2), or
+        one that serves a tool of the spec itself (a name of FIXED_TOOLS, such as "p2pact.term"):
+        it is announced under its fixed number."""
+        if (num := FIXED_TOOLS.get(name)) is not None:
+            self.tool_handlers[num] = h
+            self._reannounce_tools()
+            return
         self.tool_handlers[self.register_tool(name, 1)] = h
 
     def unregister_tool(self, name: str):
-        """Takes a named tool back: it leaves the hello (sent again to the devices in session)
-        and its handlers are dropped. Registering the name again may give another number."""
+        """Takes a tool back: it leaves the hello (sent again to the devices in session) and its
+        handlers are dropped. Registering a name again may give another number. For a tool of the
+        spec, its handlers are dropped and it leaves the hello."""
+        if (fixed := FIXED_TOOLS.get(name)) not in (None, 0):
+            if self.tool_handlers.pop(fixed, None) is not None:
+                self._reannounce_tools()
+            return
         num = self.names.pop(name, None)
         if num is None:
             return
@@ -419,12 +460,36 @@ class Node(Forwarding):
     def tool_number(self, peer: str, name: str) -> int | None:
         """Resolves a tool name to the number the device announced for it in its hello (spec
         §8); the tools of the spec have their fixed numbers. None — the device has not announced
-        it (or we have not heard its hello yet)."""
-        if (num := FIXED_TOOLS.get(name)) is not None:
-            return num
+        it (or we have not heard its hello yet). A tool with a former name (alias_tool()): see
+        resolve_tool()."""
+        r = self.resolve_tool(peer, name)
+        return r[0] if r else None
+
+    def peer_has_tool(self, peer: str, name: str) -> bool:
+        """Whether a device announced the tool in its last hello: a tool of the spec in its
+        {tool: version}, a named one in its named map. False before its hello."""
         ps = self.peers.get(peer)
-        ref = ps.named.get(name) if ps else None
-        return ref[0] if ref else None
+        if ps is None:
+            return False
+        if (num := FIXED_TOOLS.get(name)) is not None:
+            return ps.fixed is not None and num in ps.fixed
+        return name in ps.named
+
+    def resolve_tool(self, peer: str, name: str) -> tuple[int, str] | None:
+        """The number to call a tool on a device by, and the name it goes under there: the name
+        itself if the device announced it, else an alias of it (alias_tool()) the device announced
+        — a device that knows the tool only by its former name — else, for a tool of the spec, its
+        fixed number (no hello yet, or the device does not list the tool). None — a named tool the
+        device has not announced under any of its names."""
+        names = self._tool_names(name)
+        if name in names:  # asked by an alias: try it first, then the rest
+            names = [name, *(x for x in names if x != name)]
+        for nm in names:
+            if self.peer_has_tool(peer, nm):
+                return (FIXED_TOOLS[nm] if nm in FIXED_TOOLS else self.peers[peer].named[nm][0]), nm
+        if (num := FIXED_TOOLS.get(name)) is not None:
+            return num, name
+        return None
 
     def peer_tool_name(self, peer: str, tool: int) -> str:
         """The name of a tool of a device by the number it announced: what an on_event handler
@@ -444,10 +509,10 @@ class Node(Forwarding):
 
     async def call_tool_on(self, peer: str, stream: int, name: str, method: int, *args) -> list[bytes]:
         """call_on() by tool name."""
-        num = self.tool_number(peer, name)
-        if num is None:
+        r = self.resolve_tool(peer, name)
+        if r is None:
             raise P2PACTError(ERR_NO_METHOD, "the device has no tool " + name)
-        return await self.call_on(peer, stream, num, method, *args)
+        return await self.call_on(peer, stream, r[0], method, *args)
 
     def _named(self) -> dict:
         """The hello's named map: {name: [tool, version]}."""
@@ -601,7 +666,7 @@ class Node(Forwarding):
             raise P2PACTError(ERR_FAILED, "unknown device")
         if tool != 0:  # a tool's events go only to devices with at least read on it (spec §8.1)
             p = self.trust.get(peer)
-            if grant_level(p.grants if p else None, self.tool_name(tool)) < LEVEL_READ:
+            if self.level_in(p.grants if p else None, self.tool_name(tool)) < LEVEL_READ:
                 return
         self._push(ps, encode([3, tool, ev, *args]), stream, tool != 0)
 
@@ -619,7 +684,9 @@ class Node(Forwarding):
     def _info(self, peer: str):
         """The hello (spec §6, 0.2); the dictionaries are those peer may see, by slot."""
         # tools whose handlers check the caller's level are tools too
-        tools = {t: 1 for (t, _m) in (*self.handlers, *self.level_handlers) if t != 0 and t not in self.numbers}
+        # (and a tool of the spec served by one handler, handle_tool_all)
+        tools = {t: 1 for t in (*(t for (t, _m) in (*self.handlers, *self.level_handlers)), *self.tool_handlers)
+                 if t != 0 and t not in self.numbers}
         info = [self.name, _goos(), "p2pact-py", tools, self.dicts.ids(peer), hints_to_wire(self._hints()), self.kind,
                 self._named()]
         if fw := self._forwards_wire(peer):  # whom we forward to for it (spec §3)
@@ -905,7 +972,7 @@ class Node(Forwarding):
             level, forbidden = 0, False
             if tool != 0:  # grants (spec §8.1): tool 0 is always allowed
                 p = self.trust.get(peer)
-                level = grant_level(p.grants if p else None, self.tool_name(tool))
+                level = self.level_in(p.grants if p else None, self.tool_name(tool))
                 forbidden = level < self._required_level(tool, method)
             if (lh := self.level_handlers.get((tool, method))) and not forbidden:
                 h = lambda peer, args: lh(peer, level, args)
@@ -974,6 +1041,9 @@ class Node(Forwarding):
                 self.trust.set_hints(peer, str(decode(a[3]) or ""), str(decode(a[4]) or ""), hints_from_wire(decode(a[8])))
                 if len(a) >= 10 and _is_int(k := decode(a[9])):
                     self.trust.set_kind(peer, k)
+                ps.fixed = {}
+                if isinstance(tools := decode(a[6]), dict):
+                    ps.fixed = {k: v for k, v in tools.items() if _is_int(k) and _is_int(v)}
                 ps.named = {}
                 if len(a) >= 11 and isinstance(named := decode(a[10]), dict):
                     for nm, v in named.items():
