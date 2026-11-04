@@ -384,3 +384,73 @@ def test_held_dropped(tmp_path, monkeypatch):
             a.close()
             b.close()
     asyncio.run(run())
+
+
+def test_listed_dicts_kept(tmp_path):
+    """The sender lists more dictionaries than the receiver keeps of one kind (a common one the
+    receiver lacks plus four of its own for the receiver: all five are the pair's on the
+    receiver). The receiver keeps what the sender lists instead of evicting one for another and
+    fetching it back forever, and messages compressed meanwhile all run."""
+    async def run():
+        a, b = await make(tmp_path, "engine"), await make(tmp_path, "cli")
+        try:
+            asked = []
+
+            def counting(peer, args):
+                asked.append(1)
+                return a._dict_handler(peer, args)
+            a.handle(0, 5, counting)
+            await pair(a, b)
+            got = []
+            b.on_event = lambda peer, tool, ev, args: got.append(args)
+            a._add_dict(Dict(test_dict(0)))
+            for seed in range(1, 5):
+                d = Dict(test_dict(seed))
+                d.peer, d.own = b.id.addr, True
+                a._add_dict(d)
+            for i in range(20):
+                a.event(b.id.addr, 9, 1, f"{i} {LONG.decode()}")
+            await asyncio.sleep(2)
+            assert len(asked) <= 2 * 5, f"b asked for dictionaries {len(asked)} times: it evicts what a still lists"
+            assert not b.peers[a.id.addr].waiting
+            assert len([x for x in b.dicts_for(a.id.addr) if x]) == 5
+            await wait_for("not all 20 messages arrived", lambda: len(got) >= 20, 5)
+        finally:
+            a.close()
+            b.close()
+    asyncio.run(run())
+
+
+def test_held_dict_unreachable(tmp_path, monkeypatch):
+    """A message waits for a dictionary the sender cannot give: it is not dropped silently at the
+    first failed fetch, but held, asked for again and dropped after HOLD_DROP with on_held."""
+    monkeypatch.setattr(node, "HOLD_ASK", 0.2)
+    monkeypatch.setattr(node, "HOLD_DROP", 1.5)
+
+    async def run():
+        a, b = await make(tmp_path, "phone"), await make(tmp_path, "mac")
+        try:
+            await pair(a, b)
+            raw = test_dict(0)
+            a.add_dict(raw)
+            b.add_dict(raw)
+            await wait_for("lists", lambda: a.peers[b.id.addr].dicts and b.peers[a.id.addr].dicts)
+            asked = []
+
+            def refuse(peer, args):
+                asked.append(1)
+                raise P2PACTError(node.ERR_NOT_FOUND, "no such dictionary")
+            a.handle(0, 5, refuse)
+            held = []
+            b.on_held = lambda peer, k: held.append(k)
+            start = time.monotonic()
+            b.dicts.dicts = []  # b lost the dictionary and a does not know
+            b.dicts.gen += 1
+            a.event(b.id.addr, 9, 1, LONG.decode())
+            await wait_for("the held message was dropped silently or never", lambda: held, 10)
+            assert held[0] >= 1 and time.monotonic() - start >= 0.2
+            assert len(asked) >= 2, f"asked for the dictionary {len(asked)} times: not asked again before dropping"
+        finally:
+            a.close()
+            b.close()
+    asyncio.run(run())

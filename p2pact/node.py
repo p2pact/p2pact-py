@@ -134,6 +134,7 @@ class Node:
         self.id = Identity.load(dir_)
         self.trust = Trust(dir_)
         self.dicts = DictStore(dir_)
+        self.dicts.listed_by = lambda d: (ps := self.peers.get(d.peer)) is not None and d.id in ps.dicts
         # on_event(peer, tool, ev, raw_args) receives tool events (except tool 0): in the order
         # sent on each stream, one at a time, together with that stream's calls (spec §6)
         self.on_event = self.on_paired = self.on_hello = self.allow_dict = None
@@ -145,8 +146,8 @@ class Node:
         # accepts. None — the newcomer gets what it asked for.
         self.on_wants = None
         # on_held(peer, held) is called when messages from a device waited too long for a
-        # dictionary or its list and were dropped (held — how many): the application can tell
-        # the user or resend
+        # dictionary or its list, or were compressed with a dictionary the sender has dropped
+        # since, and were dropped (held — how many): the application can tell the user or resend
         self.on_held = None
         self.hints_sent: bytes | None = None  # our addresses as last announced (_reannounce)
         self.hints_at = 0.0  # when last checked
@@ -1235,9 +1236,14 @@ class Node:
             plain, why = self._unzip(ps, msg, zip_)
             if why == "missing":
                 if id_ := ps.dicts[msg[0] - 1]:
-                    self._fetch_dict(peer, ps, id_, True)
+                    if id_ not in ps.tried:  # one we could not get: _unhold asks again, then drops
+                        self._fetch_dict(peer, ps, id_)
                     return
-                why = "bad"  # a free slot: the message is damaged
+                # a free slot: the sender dropped that dictionary, the message cannot be read
+                ps.waiting.pop(0)
+                if self.on_held:
+                    asyncio.get_running_loop().call_soon(self.on_held, peer, 1)
+                continue
             if why == "nolist":
                 # a sender of an older version compresses its hello too: then we would wait for
                 # it forever. Try the dictionaries we have for it — only a hello or a list is taken
@@ -1314,10 +1320,10 @@ class Node:
         family's, say) is not asked for again until its list changes."""
         for id_ in reversed(ps.dicts):  # by slot: the newest go last
             if id_ and self.dicts.get(id_, peer) is None and id_ not in ps.tried:
-                self._fetch_dict(peer, ps, id_, False)
+                self._fetch_dict(peer, ps, id_)
                 return
 
-    def _fetch_dict(self, peer, ps, id_: bytes, waiting: bool):
+    def _fetch_dict(self, peer, ps, id_: bytes):
         """Asks the device for dictionary id_: one it compressed a waiting message with (it has
         it), or a new one in its list. What we get belongs to the pair with it."""
         if ps.fetching:
@@ -1341,10 +1347,9 @@ class Node:
             if d and not self._add_dict(d):  # could not store it: do not ask again and again
                 d = None
             if d is None:
-                if waiting and ps.waiting:
-                    ps.waiting.pop(0)  # unreachable dictionary: this message is lost
-                else:
-                    ps.tried.append(id_)
+                # not dropped at once even if a message waits for it: it stays held, _unhold asks
+                # again after HOLD_ASK and drops it after HOLD_DROP, telling the application (on_held)
+                ps.tried.append(id_)
             self._drain(peer, ps)
             self._fetch_new(peer, ps)
         asyncio.get_running_loop().create_task(run())

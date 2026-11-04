@@ -13,6 +13,11 @@ ZIP_FAST_FROM = 32 << 10
 # messages): with one it loses only a few percent of bytes
 ZIP_QUICK_BELOW = 1 << 10
 DICT_KEEP = 4  # dictionaries kept of one kind: common, ours for a device, a device's own
+# DICT_LISTED_MAX bounds the pair's dictionaries kept because the device still lists them: what a
+# device may list to another (its common ones, its own for it and the one it got from it).
+# Everything we fetch from a device is the pair's here, so its list can hold more than DICT_KEEP
+# of that kind; evicting one it lists would only make us fetch it again, and again (spec §5).
+DICT_LISTED_MAX = 3 * DICT_KEEP
 SLOTS_MAX = 32  # past this many slots, a new dictionary takes the oldest empty one
 MAGIC = b"\x28\xb5\x2f\xfd"
 
@@ -136,6 +141,9 @@ class DictStore:
         self.slots: dict[str, list[bytes]] = {}
         self.gen = 0  # bumped on every change of the dictionaries
         self.cache: dict[str, tuple[int, list[bytes]]] = {}
+        # listed_by(d) tells whether the device a pair's dictionary came from still lists it to
+        # us (None: none is): such a one is kept past DICT_KEEP, up to DICT_LISTED_MAX
+        self.listed_by = None
         try:
             lines = open(os.path.join(self.dir, "order")).read().split("\n")
         except OSError:
@@ -170,8 +178,13 @@ class DictStore:
             if x.id == d.id and x.peer == d.peer:
                 continue
             k = (x.peer, x.own)
-            kinds[k] = kinds.get(k, 0) + 1
-            (dropped if kinds[k] > DICT_KEEP else out).append(x)
+            kept = kinds.get(k, 0)
+            if kept >= DICT_KEEP and not (kept < DICT_LISTED_MAX and x.peer and not x.own
+                                          and self.listed_by is not None and self.listed_by(x)):
+                dropped.append(x)
+                continue
+            kinds[k] = kept + 1
+            out.append(x)
         for x in dropped:
             if not _listed(out, x.id):  # one file serves the same bytes kept as another kind
                 try:
