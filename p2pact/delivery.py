@@ -11,6 +11,10 @@ RTO_START, RTO_MIN, RTO_MAX = 0.5, 0.05, 4.0
 ACK_DELAY = 0.04
 CWND_START = CWND_MIN = 32
 CWND_MAX = 4096
+# GOT_MAX is how far past the first gap a part may be: the receiver drops parts at recv_ack+GOT_MAX
+# and beyond, the sender keeps new parts below its lowest unacked+GOT_MAX. (A bound on the number
+# of parts held would drop the very part the gap waits for once that many arrived above it, and
+# delivery would stop for good.)
 GOT_MAX = 8192
 MSG_MAX = 16 << 20
 
@@ -191,7 +195,7 @@ class Stream:
             retry = True
             p.timer = bool(p.sent)  # not taken as lost by an ack: the timer ran out
             self._lost(now)
-        elif self.queue and self.can_send():
+        elif self.queue and self.can_send() and (lowest == 0 or self.queue[0].seq - lowest < GOT_MAX):
             p = self.queue.pop(0)
             self.inflight[p.seq] = p
             self.inflight_bytes += len(p.data)
@@ -321,7 +325,7 @@ class Stream:
         self.unacked += 1
         if self.unacked >= 2 or seq != self.recv_ack:
             self.ack_due = now
-        if seq < self.recv_ack or seq in self.got or len(self.got) >= GOT_MAX:
+        if seq < self.recv_ack or seq in self.got or seq - self.recv_ack >= GOT_MAX:
             return
         r.data = bytes(b[pos:])
         self.got[seq] = r
